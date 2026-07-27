@@ -1,0 +1,14 @@
+# Rust
+/pc/hwinfo-pico-bridge/target/
+
+# MicroPython / Python
+__pycache__/
+*.pyc
+*.mpy
+
+# Editors and OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.swp

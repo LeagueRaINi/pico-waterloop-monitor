@@ -1,0 +1,12 @@
+# Normalise to LF everywhere. deploy-pico.ps1 sends the contents of firmware/
+# to the device byte for byte, so a checkout must not vary by platform.
+* text=auto eol=lf
+
+# Images are binary - never line-ending normalise them.
+*.jpg -text
+*.jpeg -text
+*.png -text
+
+# Fonts are generated tables; keep diffs out of the way.
+firmware/lib/st7789/romfonts/*.py linguist-generated=true
+firmware/lib/st7789/** linguist-vendored=true

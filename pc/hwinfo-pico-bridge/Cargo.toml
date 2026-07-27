@@ -1,0 +1,57 @@
+[package]
+name = "hwinfo-pico-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Pushes CPU/GPU temperatures and pump RPM from HWiNFO to the Pico display"
+
+[dependencies]
+# Serial port open/write plus enumeration with USB VID/PID, which replaces
+# both the hand-rolled DCB setup and the registry walk for finding the Pico.
+serialport = "4.9"
+# Tray icon and menu (the Tauri project's, also used by muda/winit apps).
+tray-icon = "0.24"
+# Registry access for the run-at-login entry.
+winreg = "0.56"
+# Hashing for the firmware updater, so a deploy can tell which files actually
+# changed. Only the PC ever computes these — the Pico just stores them.
+sha2 = "0.10"
+# The raw REPL is a text protocol, so file content is base64'd on the way down.
+base64 = "0.22"
+# Substring search over the REPL's response stream.
+memchr = "2.7"
+# Walking firmware/ when --firmware names a directory.
+walkdir = "2.5"
+
+# The same walk again, for the copy baked in at build time.
+[build-dependencies]
+walkdir = "2.5"
+# Microsoft's own Win32 bindings, for the two things the crates above do not
+# cover: mapping HWiNFO's shared memory, and pumping a Windows message loop.
+[dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[lib]
+name = "hwinfo_pico_bridge"
+path = "src/lib.rs"
+
+# Console front end: sensor listing, diagnostics, foreground runs.
+[[bin]]
+name = "hwinfo-pico-bridge"
+path = "src/bin/hwinfo-pico-bridge.rs"
+
+# Silent front end with a tray icon: what runs at login.
+[[bin]]
+name = "hwinfo-pico-bridge-tray"
+path = "src/bin/hwinfo-pico-bridge-tray.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,142 @@
+name: Release
+
+# Tag a commit to publish: `git tag v0.2.0 && git push origin v0.2.0`.
+#
+# Running it by hand builds and packages without publishing, so the artifacts
+# can be checked first. Tick `publish` to release from a manual run instead —
+# that tags the commit it built.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to build, e.g. v0.2.0
+        required: false
+        default: v0.0.0-test
+      publish:
+        description: Publish a release, instead of only building the files
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: windows-latest
+    env:
+      # A tag always publishes; a manual run only when asked to.
+      PUBLISH: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pc/hwinfo-pico-bridge
+
+      - name: Work out the version
+        id: version
+        shell: bash
+        run: |
+          version="${{ inputs.version || github.ref_name }}"
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "Building $version"
+
+      # A tag is not a pull request, so nothing else has necessarily checked
+      # this commit. Refusing to ship a build whose tests fail is cheap.
+      - name: Test
+        working-directory: pc/hwinfo-pico-bridge
+        run: cargo test --all-targets
+
+      - name: Build
+        working-directory: pc/hwinfo-pico-bridge
+        env:
+          BRIDGE_VERSION: ${{ steps.version.outputs.value }}
+        run: cargo build --release
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          bin=pc/hwinfo-pico-bridge/target/release
+          name="hwinfo-pico-bridge-$VERSION-windows-x64"
+
+          # One folder with everything needed to run, so extracting it
+          # anywhere is all that is required.
+          mkdir -p "stage/$name" dist
+          cp "$bin/hwinfo-pico-bridge.exe" "stage/$name/"
+          cp "$bin/hwinfo-pico-bridge-tray.exe" "stage/$name/"
+          cp README.md LICENSE "stage/$name/"
+          (cd stage && 7z a -tzip -mx=9 "../dist/$name.zip" "$name" >/dev/null)
+
+          # firmware/ is already compiled into both binaries; this is only for
+          # anyone who would rather copy it across with Thonny or mpremote.
+          7z a -tzip -mx=9 "dist/pico-firmware-$VERSION.zip" firmware >/dev/null
+
+          (cd dist && sha256sum ./*.zip > SHA256SUMS.txt)
+          ls -l dist
+
+      # Available on manual runs too, which is what makes a dry run useful.
+      - uses: actions/upload-artifact@v5
+        with:
+          name: release-${{ steps.version.outputs.value }}
+          path: dist/*
+
+      - name: Publish
+        if: env.PUBLISH == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          # Named explicitly so a manual run has something to attach to; on a
+          # tag push this is the tag that triggered the run anyway.
+          tag_name: ${{ steps.version.outputs.value }}
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            Windows x64. Download
+            `hwinfo-pico-bridge-${{ steps.version.outputs.value }}-windows-x64.zip`
+            and extract it anywhere.
+
+            ```powershell
+            # copy the display firmware to a Pico running MicroPython
+            .\hwinfo-pico-bridge.exe --deploy
+
+            # then start the tray app at login
+            .\hwinfo-pico-bridge.exe --install
+            ```
+
+            The display firmware is built into both binaries, so nothing else
+            is needed. `pico-firmware-${{ steps.version.outputs.value }}.zip`
+            is only there if you would rather copy the files across yourself
+            with Thonny or `mpremote`.
+
+            HWiNFO must be running with **Settings → Main Settings → Shared
+            Memory Support** enabled, which is a registered-version feature.
+
+            Verify a download against `SHA256SUMS.txt`:
+
+            ```powershell
+            (Get-FileHash .\hwinfo-pico-bridge-${{ steps.version.outputs.value }}-windows-x64.zip).Hash.ToLower()
+            ```
+
+      # Otherwise a run that deliberately did not publish looks like one that
+      # failed to, which is exactly the confusion worth avoiding.
+      - name: Say what this run did
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          if [ "$PUBLISH" = "true" ]; then
+            echo "Published **$VERSION**." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Built **$VERSION** without publishing." >> "$GITHUB_STEP_SUMMARY"
+            echo "The files are attached to this run as an artifact." >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "To publish: push a tag (\`git tag $VERSION && git push origin $VERSION\`)," >> "$GITHUB_STEP_SUMMARY"
+            echo "or run this again with **publish** ticked." >> "$GITHUB_STEP_SUMMARY"
+          fi

@@ -1,0 +1,1025 @@
+import math
+import micropython
+import sys
+import time
+from array import array
+from machine import ADC
+
+import st7789.st7789py as st7789
+import st7789.config.tft_config as tft_config
+
+import st7789.romfonts.vga1_8x8 as font_small
+import st7789.romfonts.vga2_16x16 as font_med
+import st7789.romfonts.vga2_bold_16x32 as font_big
+
+# =========================================================
+# THERMISTOR CONFIG
+# =========================================================
+ADC_PIN = 26
+R_FIXED = 10_000
+VCC     = 3.3
+R0      = 10_000
+T0      = 298.15
+B       = 3435
+
+ADC_OVERSAMPLE = 16     # ADC reads averaged per sample
+EMA_ALPHA      = 0.25   # smoothing of the displayed coolant number
+
+adc = ADC(ADC_PIN)
+
+# =========================================================
+# DISPLAY
+# =========================================================
+tft = tft_config.config(3)
+W   = tft.width          # 320
+H   = tft.height         # 240
+
+# =========================================================
+# COLORS
+# =========================================================
+BG         = st7789.color565(8, 10, 14)
+PANEL      = st7789.color565(18, 22, 30)
+GRID       = st7789.color565(28, 34, 42)
+TEXT_DIM   = st7789.color565(130, 140, 150)
+TEXT_BRIGHT= st7789.color565(215, 225, 235)
+PUMP_COL   = st7789.color565(90, 200, 255)
+COLD       = st7789.color565(80, 180, 255)
+NORMAL     = st7789.color565(0, 220, 180)
+HOT        = st7789.color565(255, 140, 60)
+CRIT       = st7789.color565(255, 70, 70)
+CPU_COL    = st7789.color565(255, 120, 90)
+GPU_COL    = st7789.color565(150, 130, 255)
+# Muted variants for the temperature panel, where coolant is the subject and
+# the silicon is context. On the power panel they are the subject, so they
+# keep their full-strength colours there.
+CPU_MUTED  = st7789.color565(150, 70, 52)
+GPU_MUTED  = st7789.color565(88, 76, 150)
+STALE      = st7789.color565(90, 96, 105)
+
+# =========================================================
+# TIMEBASE  —  30 minute rolling window
+#
+# Sampling stays fast so the big number reacts, but samples are averaged into
+# BUCKET_SECONDS-wide buckets; one bucket is one plotted point.
+# =========================================================
+WINDOW_SECONDS  = 30 * 60                            # 1800 s of history
+HISTORY_POINTS  = 180                                # points across the graph
+BUCKET_SECONDS  = WINDOW_SECONDS / HISTORY_POINTS    # 10 s per point
+BUCKET_MS       = int(BUCKET_SECONDS * 1000)
+
+SAMPLE_PERIOD   = 0.25          # ADC / big number update period
+GRAPH_PERIOD_MS = 2000          # graph panel redraw period
+PC_TIMEOUT_MS   = 8000          # no serial data for this long -> "NO DATA"
+STANDBY_AFTER_MS = 10 * 60 * 1000   # dark after this long unlinked; 0 disables
+
+# =========================================================
+# LAYOUT (320 x 240)
+# =========================================================
+TEMP_X, TEMP_Y     = 14, 8
+TEMP_BUF_W         = 88         # big number + degree marker, no trend arrow
+TEMP_BUF_H         = 40
+TEMP_INSET_Y       = 4
+TEMP_BUF_SCREEN_X  = TEMP_X
+TEMP_BUF_SCREEN_Y  = TEMP_Y - TEMP_INSET_Y
+
+LABEL_X, LABEL_Y   = 16, 48     # static "COOLANT" caption
+
+# CPU / GPU / PUMP readouts in three columns: label, temperature, watts.
+# There is no separate link indicator - when PC data goes stale every row
+# greys out, which says the same thing.
+#
+# Values are right-aligned in fixed-width fields so the digits line up down
+# the column, which is what sets the widths below: four characters for the
+# middle column to fit a pump RPM, three for watts. Temperatures are whole
+# degrees here; only the big coolant number keeps its decimal.
+PC_X, PC_Y         = 112, 6
+PC_BUF_W           = 208
+PC_BUF_H           = 58
+PC_COL_VALUE       = 68         # temperature / pump, clear of the 4-char "PUMP"
+PC_COL_VALUE_UNIT  = 134
+PC_COL_WATTS       = 150
+PC_COL_WATTS_UNIT  = 200
+PC_UNIT_DY         = 4          # centres the 8px unit against the 16px value
+PC_ROW_Y           = (0, 21, 42)
+PUMP_MIN_RPM       = 300        # below this the pump is considered stalled
+
+GRAPH_X            = 14
+GRAPH_W            = 292
+# One graph for every temperature, one for power. Removing the footer and
+# merging the two temperature panels bought 26px of graph height.
+G1_Y,  G1_H        = 72,  76    # coolant + cpu + gpu, dual scale
+G2_Y,  G2_H        = 160, 74    # cpu + gpu power
+
+# =========================================================
+# HISTORY
+# One entry per bucket, oldest first, newest last.  An entry may be None,
+# meaning "no data for that bucket" - the graph breaks the line there instead
+# of inventing a value.  Every series shares the same bucket clock, so a given
+# index is the same moment in time on both graphs.
+# =========================================================
+class Series:
+    """A rolling window of bucket averages, plus the bucket being filled."""
+
+    __slots__ = ("hist", "_total", "_count")
+
+    def __init__(self):
+        self.hist = []
+        self._total = 0.0
+        self._count = 0
+
+    def add(self, value):
+        if value is not None:
+            self._total += value
+            self._count += 1
+
+    def _bucket_avg(self):
+        return (self._total / self._count) if self._count else None
+
+    def close(self):
+        """Commit the open bucket to history and start a fresh one."""
+        self.hist.append(self._bucket_avg())
+        while len(self.hist) > HISTORY_POINTS:
+            self.hist.pop(0)
+        self._total = 0.0
+        self._count = 0
+
+    def push_live(self):
+        """
+        Temporarily append the still-open bucket so the graphs move between
+        bucket boundaries instead of freezing for 10 s at a time.
+
+        The list is allowed to run one over HISTORY_POINTS - trimming it would
+        discard a real bucket that pop_live() could not put back.  The plotter
+        just lets the oldest point fall off the left edge.
+        """
+        self.hist.append(self._bucket_avg())
+
+    def pop_live(self):
+        if self.hist:
+            self.hist.pop()
+
+
+loop_s  = Series()      # coolant, from the thermistor
+cpu_s   = Series()      # cpu hotspot
+gpu_s   = Series()      # gpu hotspot
+cpu_w_s = Series()      # cpu package power
+gpu_w_s = Series()      # gpu board power
+
+ALL_SERIES = (loop_s, cpu_s, gpu_s, cpu_w_s, gpu_w_s)
+
+# latest values from the PC bridge
+pc_cpu     = None
+pc_gpu     = None
+pc_pump    = None      # pump RPM, off the CPU fan header
+pc_cpu_w   = None
+pc_gpu_w   = None
+pc_last_ms = None
+
+# =========================================================
+# OFF-SCREEN BUFFERS (RGB565, big-endian)
+# The two graph panels share one buffer: same width, so the shorter panel is
+# exactly the first G2_H rows of it.  Each is drawn and blitted in turn.
+# =========================================================
+temp_buf  = bytearray(TEMP_BUF_W * TEMP_BUF_H * 2)
+pc_buf    = bytearray(PC_BUF_W * PC_BUF_H * 2)
+graph_buf = bytearray(GRAPH_W * max(G1_H, G2_H) * 2)
+
+_G1_BYTES = GRAPH_W * G1_H * 2
+_G2_BYTES = GRAPH_W * G2_H * 2
+
+# =========================================================
+# LOW-LEVEL BUFFER PRIMITIVES
+#
+# Buffers are RGB565 big-endian, which is what the panel wants off the wire.
+# The RP2040 is little-endian, so one 16-bit store of a byte-swapped value
+# does what two byte stores did - hence the ((lo << 8) | hi) shuffling below.
+#
+# They are viper, and allocate nothing per call: a redraw touches tens of
+# thousands of pixels, and both the bytecode and the garbage it would make
+# dominate everything else the firmware does. Viper takes at most four
+# arguments, so anything wanting more is handed a preallocated array.
+# =========================================================
+@micropython.viper
+def _fill16(buf: ptr16, start: int, count: int, color: int):
+    """`count` pixels from pixel index `start`."""
+    value = ((color & 0xFF) << 8) | ((color >> 8) & 0xFF)
+    i = start
+    end = start + count
+    while i < end:
+        buf[i] = value
+        i = i + 1
+
+
+@micropython.viper
+def _stride16(buf: ptr16, start: int, count: int, packed: int):
+    """`count` pixels from `start`, one every `packed >> 16` pixels."""
+    stride = packed >> 16
+    color = packed & 0xFFFF
+    value = ((color & 0xFF) << 8) | ((color >> 8) & 0xFF)
+    i = start
+    n = count
+    while n > 0:
+        buf[i] = value
+        i = i + stride
+        n = n - 1
+
+
+def _buf_fill(buf, color, nbytes=None):
+    if nbytes is None:
+        nbytes = len(buf)
+    _fill16(buf, 0, nbytes >> 1, color)
+
+
+def _buf_hline(buf, x, y, length, color, buf_w, buf_h):
+    if not (0 <= y < buf_h):
+        return
+    x0 = x if x > 0 else 0
+    x1 = x + length
+    if x1 > buf_w:
+        x1 = buf_w
+    if x0 >= x1:
+        return
+    _fill16(buf, y * buf_w + x0, x1 - x0, color)
+
+
+def _buf_vrun(buf, x, y0, y1, color, buf_w, buf_h):
+    """Fill the vertical span y0..y1 (inclusive) of column x."""
+    if not (0 <= x < buf_w):
+        return
+    if y0 < 0:
+        y0 = 0
+    if y1 > buf_h - 1:
+        y1 = buf_h - 1
+    if y0 > y1:
+        return
+    _stride16(buf, y0 * buf_w + x, y1 - y0 + 1, (buf_w << 16) | color)
+
+
+# bw, bh, x, y, fw, fh, bytes_per_row, glyph offset, fg, bg (-1 transparent)
+_GLYPH_META = array('i', bytearray(10 * 4))
+
+
+@micropython.viper
+def _glyph16(buf: ptr16, font_data: ptr8, meta: ptr32):
+    buf_w = int(meta[0])
+    buf_h = int(meta[1])
+    x = int(meta[2])
+    y = int(meta[3])
+    fw = int(meta[4])
+    fh = int(meta[5])
+    bytes_per_row = int(meta[6])
+    offset = int(meta[7])
+    fg = int(meta[8])
+    bg = int(meta[9])
+
+    fg_value = ((fg & 0xFF) << 8) | ((fg >> 8) & 0xFF)
+    bg_value = ((bg & 0xFF) << 8) | ((bg >> 8) & 0xFF)
+
+    row = 0
+    while row < fh:
+        py = y + row
+        if py >= 0:
+            if py < buf_h:
+                base = py * buf_w
+                row_offset = offset + row * bytes_per_row
+                col = 0
+                while col < fw:
+                    px = x + col
+                    if px >= 0:
+                        if px < buf_w:
+                            bits = int(font_data[row_offset + (col >> 3)])
+                            if (bits >> (7 - (col & 7))) & 1:
+                                buf[base + px] = fg_value
+                            elif bg >= 0:
+                                buf[base + px] = bg_value
+                    col = col + 1
+        row = row + 1
+
+
+def _buf_text(buf, font, string, x, y, fg, bg, buf_w, buf_h):
+    """
+    Render a fixed-width font into the buffer.
+    Font format: WIDTH, HEIGHT, FIRST, LAST, FONT = memoryview of all glyph bitmaps.
+    Bitmap: each glyph is stored row-major, each byte = 8 horizontal pixels (MSB left).
+    """
+    fw = font.WIDTH
+    fh = font.HEIGHT
+    first = font.FIRST
+    last = font.LAST
+    bytes_per_row = (fw + 7) // 8
+    bytes_per_glyph = bytes_per_row * fh
+    font_data = font.FONT          # memoryview
+
+    meta = _GLYPH_META
+    meta[0] = buf_w
+    meta[1] = buf_h
+    meta[3] = y
+    meta[4] = fw
+    meta[5] = fh
+    meta[6] = bytes_per_row
+    meta[8] = fg
+    meta[9] = -1 if bg is None else bg
+
+    cx = x
+    for ch in string:
+        code = ord(ch)
+        if first <= code <= last:
+            meta[2] = cx
+            # An offset into the whole table, rather than slicing the glyph
+            # out: the slice was a fresh memoryview per character.
+            meta[7] = (code - first) * bytes_per_glyph
+            _glyph16(buf, font_data, meta)
+        # An undefined character just advances the width.
+        cx += fw
+
+
+def _buf_text_on_backing(buf, font, string, x, y, fg, backing, buf_w, buf_h):
+    """
+    Text over a cleared rectangle, for labels that sit inside a graph.
+
+    Labels are drawn after the traces, so a line crossing one would otherwise
+    tangle with the glyph strokes and leave neither readable. Outlining each
+    stroke would hide less of the data, but costs far more per frame.
+    """
+    height = font.HEIGHT
+    width = len(string) * font.WIDTH
+    for row in range(y - 1, y + height + 1):
+        _buf_hline(buf, x - 1, row, width + 2, backing, buf_w, buf_h)
+    _buf_text(buf, font, string, x, y, fg, None, buf_w, buf_h)
+
+# =========================================================
+# COLOUR HELPERS
+# =========================================================
+def lerp(a, b, t):
+    return int(a + (b - a) * t)
+
+
+def lerp_color(c1, c2, t):
+    r = lerp((c1 >> 11) & 0x1F, (c2 >> 11) & 0x1F, t)
+    g = lerp((c1 >> 5)  & 0x3F, (c2 >> 5)  & 0x3F, t)
+    b = lerp(c1 & 0x1F,         c2 & 0x1F,         t)
+    return (r << 11) | (g << 5) | b
+
+
+def temp_color(temp):
+    """Colour ramp for the coolant loop (roughly 20 .. 45 C)."""
+    if temp <= 25:
+        return COLD
+    if temp <= 35:
+        return lerp_color(COLD, NORMAL, (temp - 25) / 10)
+    return lerp_color(NORMAL, HOT, min((temp - 35) / 10, 1.0))
+
+
+def pc_temp_color(temp):
+    """Colour ramp for silicon temperatures (roughly 40 .. 95 C)."""
+    if temp <= 55:
+        return NORMAL
+    if temp <= 80:
+        return lerp_color(NORMAL, HOT, (temp - 55) / 25)
+    return lerp_color(HOT, CRIT, min((temp - 80) / 12, 1.0))
+
+
+
+# =========================================================
+# THERMISTOR
+# =========================================================
+def read_ntc_resistance():
+    raw = 0
+    for _ in range(ADC_OVERSAMPLE):
+        raw += adc.read_u16()
+    raw /= ADC_OVERSAMPLE
+    vout = (raw / 65535) * VCC
+    vout = max(0.001, min(VCC - 0.001, vout))
+    return (R_FIXED * vout) / (VCC - vout)
+
+
+def resistance_to_celsius(r):
+    if r <= 0:
+        return None
+    inv_t = (1.0 / T0) + (1.0 / B) * math.log(r / R0)
+    return (1.0 / inv_t) - 273.15
+
+
+def read_temperature():
+    return resistance_to_celsius(read_ntc_resistance())
+
+# =========================================================
+# PC LINK
+#
+# The Pico has no network, but it is plugged into the PC for power and
+# MicroPython exposes that USB port as a serial console.  While this script is
+# running it owns stdin, so the PC-side bridge can just write lines to it:
+#
+#     T,<cpu>,<gpu>,<pump>,<cpuW>,<gpuW>\n
+#         e.g.  "T,64.5,71.0,1532,142,318"  or  "T,-,71.0,-,-,318"
+#
+# CPU and GPU are hotspot temperatures, pump is RPM off the CPU fan header,
+# and the last two are CPU package power and GPU board power in watts.
+# "-" (or anything unparsable) means that sensor is unavailable.  Trailing
+# fields may be missing entirely, so an older bridge still works.
+#
+# The updater asks one question, so that an update with nothing to send need
+# not stop this script to find that out. A match means the device already
+# holds those files, and it is left running - the graphs live in RAM, and a
+# soft reset would empty them.
+#
+#     ?M      ->   M,<sha256 of the deploy record>   or   M,-
+# =========================================================
+DEPLOY_RECORD = "/.pico-deploy"
+
+_rx_line = ""
+_stdin_poll = None
+
+try:
+    import select
+    _stdin_poll = select.poll()
+    _stdin_poll.register(sys.stdin, select.POLLIN)
+except Exception:
+    _stdin_poll = None      # no serial link available; the rest still works
+
+
+def _parse_field(parts, index, lo, hi):
+    if len(parts) <= index:
+        return None
+    try:
+        v = float(parts[index])
+    except ValueError:
+        return None
+    if v < lo or v > hi:
+        return None
+    return v
+
+
+_deploy_id = None
+
+
+def _hash_deploy_record():
+    """
+    sha256 of the deploy record, hex, or "-" if it cannot be read.
+
+    Only the PC ever interprets this; the device just reports what it has.
+    """
+    try:
+        import hashlib
+        import binascii
+    except ImportError:
+        return "-"
+    try:
+        h = hashlib.sha256()
+        f = open(DEPLOY_RECORD, "rb")
+        try:
+            buf = bytearray(256)
+            mv = memoryview(buf)
+            while True:
+                n = f.readinto(buf)
+                if not n:
+                    break
+                h.update(mv[:n])
+        finally:
+            f.close()
+        return binascii.hexlify(h.digest()).decode()
+    except (OSError, AttributeError):
+        return "-"
+
+
+def _handle_query(line):
+    """
+    Answer the updater.  Computed once and kept: the record can only change
+    via the REPL, and reaching the REPL stops this script anyway.
+    """
+    global _deploy_id
+    if line[1:2].upper() != "M":
+        return
+    if _deploy_id is None:
+        _deploy_id = _hash_deploy_record()
+    sys.stdout.write("M," + _deploy_id + "\n")
+
+
+def _handle_line(line):
+    global pc_cpu, pc_gpu, pc_pump, pc_cpu_w, pc_gpu_w, pc_last_ms, _idle_ms
+    if line[:1] == "?":
+        _handle_query(line)
+        return
+    parts = line.replace(",", " ").split()
+    if len(parts) < 2 or parts[0].upper() != "T":
+        return
+    pc_cpu = _parse_field(parts, 1, -50, 150)
+    pc_gpu = _parse_field(parts, 2, -50, 150)
+    pc_pump = _parse_field(parts, 3, 0, 20000)
+    pc_cpu_w = _parse_field(parts, 4, 0, 2000)
+    pc_gpu_w = _parse_field(parts, 5, 0, 2000)
+    pc_last_ms = time.ticks_ms()
+    _idle_ms = 0
+
+
+def poll_pc_link():
+    """Drain whatever is waiting on USB CDC and parse complete lines."""
+    global _rx_line
+    if _stdin_poll is None:
+        return
+    budget = 256
+    while budget > 0 and _stdin_poll.poll(0):
+        ch = sys.stdin.read(1)
+        if not ch:
+            break
+        budget -= 1
+        if ch == "\n" or ch == "\r":
+            if _rx_line:
+                try:
+                    _handle_line(_rx_line)
+                except Exception:
+                    pass
+                _rx_line = ""
+        elif len(_rx_line) < 48:
+            _rx_line += ch
+        else:
+            _rx_line = ""     # runaway line, resync
+
+
+def pc_link_fresh():
+    if pc_last_ms is None:
+        return False
+    return time.ticks_diff(time.ticks_ms(), pc_last_ms) < PC_TIMEOUT_MS
+
+# =========================================================
+# STANDBY
+#
+# Not for burn-in: this is an IPS LCD, where that is not a failure mode. The
+# backlight is what ages, and it is most of what the board draws, so there is
+# no reason to run it while the PC it reports on is asleep.
+#
+# Sampling carries on while dark, so waking shows a real half hour of history
+# rather than an empty graph.
+# =========================================================
+try:
+    import st7789.config.tft_buttons as tft_buttons
+    _wake_keys = tuple(getattr(tft_buttons.Buttons(), "key%d" % i) for i in range(4))
+except Exception:
+    _wake_keys = ()          # no buttons wired; the PC link still wakes it
+
+_standby = False
+# Counted up by the main loop and zeroed whenever the PC speaks, rather than
+# measured against ticks_ms.  time.ticks_diff is only meaningful for about six
+# days, and a Pico on standby USB power outlives that easily.
+_idle_ms = 0
+
+
+def _standby_due():
+    """
+    Whether to go dark.
+
+    Never on a Pico that has not once heard from a PC: that is standalone use,
+    where the coolant half works perfectly well on its own and blanking it
+    would just look broken.
+    """
+    return (STANDBY_AFTER_MS > 0
+            and pc_last_ms is not None
+            and _idle_ms > STANDBY_AFTER_MS)
+
+
+def _wake_pressed():
+    for key in _wake_keys:            # active low; the config pulls them up
+        if key.value() == 0:
+            return True
+    return False
+
+
+def enter_standby():
+    global _standby
+    _standby = True
+    # Backlight first: the panel may show anything on its way into sleep, and
+    # there is no reason for that to be visible.
+    if tft.backlight is not None:
+        tft.backlight.value(0)
+    tft.sleep_mode(True)
+
+
+def leave_standby():
+    global _standby, _idle_ms, _last_temp_key, _last_pc_key
+    _standby = False
+    _idle_ms = 0
+    tft.sleep_mode(False)
+    time.sleep_ms(120)                # the ST7789 wants this after SLPOUT
+    # Nothing was drawn while dark and the panel's contents are not worth
+    # trusting, so rebuild the screen before lighting it.
+    draw_static_screen()
+    _last_temp_key = None             # force the cached panels to redraw
+    _last_pc_key = None
+    if tft.backlight is not None:
+        tft.backlight.value(1)
+
+# =========================================================
+# STATIC SCREEN (drawn once directly to the display)
+# =========================================================
+def draw_static_screen():
+    tft.fill(BG)
+    tft.fill_rect(GRAPH_X - 4, G1_Y - 4, GRAPH_W + 8, G1_H + 8, PANEL)
+    tft.fill_rect(GRAPH_X - 4, G2_Y - 4, GRAPH_W + 8, G2_H + 8, PANEL)
+    tft.text(font_small, "COOLANT", LABEL_X, LABEL_Y, TEXT_DIM, BG)
+
+# =========================================================
+# HEADER: BIG COOLANT NUMBER
+# =========================================================
+_last_temp_key = None
+
+def draw_temperature(temp):
+    """Returns True if the buffer changed and needs blitting."""
+    global _last_temp_key
+
+    temp_text = "{:4.1f}".format(temp)
+    if temp_text == _last_temp_key:
+        return False
+    _last_temp_key = temp_text
+
+    _buf_fill(temp_buf, BG)
+    color = temp_color(temp)
+
+    _buf_text(temp_buf, font_big, temp_text, 0, TEMP_INSET_Y,
+              color, BG, TEMP_BUF_W, TEMP_BUF_H)
+
+    deg_x = len(temp_text) * font_big.WIDTH + 4
+    _buf_text(temp_buf, font_med, "C", deg_x, 8, TEXT_DIM, BG,
+              TEMP_BUF_W, TEMP_BUF_H)
+    return True
+
+# =========================================================
+# HEADER: CPU / GPU / PUMP READOUT
+# =========================================================
+_last_pc_key = None
+
+# Missing values are two dashes, right-aligned in their column so they land
+# where the digits would. Filling the column instead ("----") crowds the label
+# it sits next to, and a lone "-" strands itself against the panel edge.
+NO_VALUE_3 = " --"
+NO_VALUE_4 = "  --"
+
+
+def _pc_row(label, y, label_color, value_text, value_color, value_unit=None,
+            watt_text=None, watt_color=None):
+    # The CPU and GPU labels carry the series colour - that is what identifies
+    # the traces on the graphs below, so neither graph needs a legend.
+    _buf_text(pc_buf, font_med, label, 0, y, label_color, BG,
+              PC_BUF_W, PC_BUF_H)
+    _buf_text(pc_buf, font_med, value_text, PC_COL_VALUE, y, value_color, BG,
+              PC_BUF_W, PC_BUF_H)
+    if value_unit is not None:
+        _buf_text(pc_buf, font_small, value_unit, PC_COL_VALUE_UNIT,
+                  y + PC_UNIT_DY, value_color, BG, PC_BUF_W, PC_BUF_H)
+    if watt_text is not None:
+        _buf_text(pc_buf, font_med, watt_text, PC_COL_WATTS, y, watt_color, BG,
+                  PC_BUF_W, PC_BUF_H)
+        _buf_text(pc_buf, font_small, "W", PC_COL_WATTS_UNIT,
+                  y + PC_UNIT_DY, watt_color, BG, PC_BUF_W, PC_BUF_H)
+
+
+def draw_pc_panel():
+    """Returns True if the buffer changed and needs blitting."""
+    global _last_pc_key
+
+    live = pc_link_fresh()
+    rpm = int(pc_pump) if pc_pump is not None else None
+    key = (live,
+           None if pc_cpu is None else int(pc_cpu),
+           None if pc_gpu is None else int(pc_gpu),
+           rpm,
+           None if pc_cpu_w is None else int(pc_cpu_w),
+           None if pc_gpu_w is None else int(pc_gpu_w))
+    if key == _last_pc_key:
+        return False
+    _last_pc_key = key
+
+    _buf_fill(pc_buf, BG)
+
+    for label, color, temp, watts, y in (
+            ("CPU", CPU_COL, pc_cpu, pc_cpu_w, PC_ROW_Y[0]),
+            ("GPU", GPU_COL, pc_gpu, pc_gpu_w, PC_ROW_Y[1])):
+        if live and temp is not None:
+            _pc_row(label, y, color, "{:4.0f}".format(temp), pc_temp_color(temp),
+                    "C",
+                    "{:3.0f}".format(watts) if watts is not None else NO_VALUE_3,
+                    TEXT_BRIGHT if watts is not None else STALE)
+        else:
+            _pc_row(label, y, STALE, NO_VALUE_4, STALE, "C", NO_VALUE_3, STALE)
+
+    if live and rpm is not None:
+        # A stalled pump is the one failure that actually matters here, so it
+        # gets the alarm colour rather than blending in.
+        _pc_row("PUMP", PC_ROW_Y[2], PUMP_COL, "{:4d}".format(rpm),
+                CRIT if rpm < PUMP_MIN_RPM else TEXT_BRIGHT, "RPM")
+    else:
+        _pc_row("PUMP", PC_ROW_Y[2], STALE, NO_VALUE_4, STALE, "RPM")
+    return True
+
+# =========================================================
+# GRAPH ENGINE
+#
+# The newest point sits on the right edge and history extends leftwards, so
+# "now" is always in the same place and the 5-minute gridlines mean the same
+# thing from the first second onwards.
+# =========================================================
+X_STEP = (GRAPH_W - 1) / (HISTORY_POINTS - 1)
+
+
+def _graph_background(buf, bw, bh, nbytes, hlines=True):
+    _buf_fill(buf, PANEL, nbytes)
+    if hlines:
+        for i in range(1, 4):                   # horizontal grid
+            _buf_hline(buf, 0, (bh * i) // 4, bw, GRID, bw, bh)
+    for i in range(1, 6):                       # every 5 minutes
+        _buf_vrun(buf, (bw - 1) * i // 6, 0, bh - 1, GRID, bw, bh)
+
+
+def _series_range(series_list, min_span=2.0):
+    """Common (tmin, span) across every series that has data."""
+    lo = None
+    hi = None
+    for data in series_list:
+        for v in data:
+            if v is None:
+                continue
+            if lo is None or v < lo:
+                lo = v
+            if hi is None or v > hi:
+                hi = v
+    if lo is None:
+        return None, None
+    span = max(min_span, hi - lo)
+    mid = (lo + hi) / 2
+    return mid - span / 2, span
+
+
+def _latest(data):
+    """Newest non-None sample, for colouring things by the current value."""
+    for i in range(len(data) - 1, -1, -1):
+        if data[i] is not None:
+            return data[i]
+    return None
+
+
+# One column's y and colour, filled in by _plot_series and drawn by _plot_run.
+_PLOT_GAP = 0xFFFF          # no data for this column; break the line
+_PLOT_YS = array('H', bytearray(GRAPH_W * 2))
+_PLOT_COLS = array('H', bytearray(GRAPH_W * 2))
+_PLOT_META = array('i', bytearray(5 * 4))   # bw, bh, start_px, count, half_width
+
+
+@micropython.viper
+def _plot_run(buf: ptr16, ys: ptr16, cols: ptr16, meta: ptr32):
+    """
+    Draw a whole prepared series - one call rather than one per column, since
+    the joining-up and the pixels are all integer work.
+    """
+    buf_w = int(meta[0])
+    buf_h = int(meta[1])
+    start = int(meta[2])
+    count = int(meta[3])
+    half = int(meta[4])
+
+    prev = -1                       # y of the column before, -1 after a gap
+    i = 0
+    while i < count:
+        py = int(ys[i])
+        if py == 0xFFFF:
+            prev = -1
+        else:
+            top = py - half
+            bot = py + half
+            if prev >= 0:           # span the step, so the line joins up
+                if prev - half < top:
+                    top = prev - half
+                if prev + half > bot:
+                    bot = prev + half
+            if top < 0:
+                top = 0
+            if bot > buf_h - 1:
+                bot = buf_h - 1
+            color = int(cols[i])
+            value = ((color & 0xFF) << 8) | ((color >> 8) & 0xFF)
+            index = top * buf_w + start + i
+            n = bot - top + 1
+            while n > 0:
+                buf[index] = value
+                index = index + buf_w
+                n = n - 1
+            prev = py
+        i = i + 1
+
+
+def _plot_series(buf, bw, bh, data, color, tmin, span, half_width=1):
+    """`color` is either a 565 value or a function of the sample value."""
+    tinted = callable(color)
+    n = len(data)
+    if n < 1:
+        return
+
+    x_first = (bw - 1) - (n - 1) * X_STEP       # x of data[0]
+    start_px = int(x_first) if x_first > 0 else 0
+    inv_span = 1.0 / span
+    usable = bh - 1
+
+    # Interpolation is floating point, which viper does not do, so the values
+    # are worked out here and the drawing handed over in one go.
+    ys = _PLOT_YS
+    cols = _PLOT_COLS
+    count = 0
+
+    for px in range(start_px, bw):
+        pos = (px - x_first) / X_STEP
+        if pos < 0:
+            pos = 0.0
+        i = int(pos)
+        if i >= n - 1:
+            val = data[n - 1]
+        else:
+            a = data[i]
+            b = data[i + 1]
+            if a is None or b is None:
+                val = None
+            else:
+                val = a + (b - a) * (pos - i)
+
+        if val is None:                          # gap in the data
+            ys[count] = _PLOT_GAP
+        else:
+            f = (val - tmin) * inv_span
+            if f < 0.04:
+                f = 0.04
+            elif f > 0.96:
+                f = 0.96
+            ys[count] = usable - int(f * usable)
+            cols[count] = color(val) if tinted else color
+        count += 1
+
+    meta = _PLOT_META
+    meta[0] = bw
+    meta[1] = bh
+    meta[2] = start_px
+    meta[3] = count
+    meta[4] = half_width
+    _plot_run(buf, ys, cols, meta)
+
+
+def _scale_label(buf, bw, bh, tmin, span, unit, color=TEXT_DIM, right=False):
+    """
+    One compact "low-high" label per scale, in the top corner.
+
+    A number at each end of each scale meant four figures scattered around a
+    panel that already carries three traces. This says the same thing in one
+    place per scale, with the unit on the end so the panel needs no caption.
+    """
+    text = "{:.0f}-{:.0f}{}".format(tmin, tmin + span, unit)
+    x = (bw - 3 - len(text) * font_small.WIDTH) if right else 3
+    _buf_text_on_backing(buf, font_small, text, x, 2, color, PANEL, bw, bh)
+
+
+def draw_temp_graph():
+    """
+    Coolant, CPU and GPU on one panel, on two scales.
+
+    Coolant moves across a couple of degrees while the silicon moves across
+    tens, so a single shared range would squash the coolant trace into a line
+    a few pixels tall - the one series you most want to read. Instead the
+    silicon is labelled down the left and coolant down the right in its own
+    colour, and each uses the full panel height. The time axis is shared, so
+    load and its effect on the water line up vertically.
+
+    Three traces on one panel gets busy, so everything except coolant is
+    turned down: the silicon is hairline and muted, and the horizontal grid is
+    dropped - with two scales in play those lines corresponded to neither, so
+    they were decoration that happened to look like information.
+    """
+    bw, bh = GRAPH_W, G1_H
+    _graph_background(graph_buf, bw, bh, _G1_BYTES, hlines=False)
+
+    si_min, si_span = _series_range((cpu_s.hist, gpu_s.hist))
+    lo_min, lo_span = _series_range((loop_s.hist,))
+
+    # Silicon first, so coolant lands on top of it where they cross.
+    if si_min is not None:
+        _plot_series(graph_buf, bw, bh, gpu_s.hist, GPU_MUTED,
+                     si_min, si_span, half_width=0)
+        _plot_series(graph_buf, bw, bh, cpu_s.hist, CPU_MUTED,
+                     si_min, si_span, half_width=0)
+        _scale_label(graph_buf, bw, bh, si_min, si_span, "C")
+    # Coolant is thicker rather than area-filled: a fill under two other
+    # traces muddies them, so weight marks the primary series instead.
+    if lo_min is not None:
+        _plot_series(graph_buf, bw, bh, loop_s.hist, temp_color,
+                     lo_min, lo_span, half_width=1)
+        newest = _latest(loop_s.hist)
+        _scale_label(graph_buf, bw, bh, lo_min, lo_span, "C",
+                     temp_color(newest) if newest is not None else NORMAL,
+                     right=True)
+    tft.blit_buffer(memoryview(graph_buf)[:_G1_BYTES], GRAPH_X, G1_Y, bw, bh)
+
+
+def draw_power_graph():
+    """CPU and GPU power on a shared scale - both are watts, so they compare."""
+    bw, bh = GRAPH_W, G2_H
+    _graph_background(graph_buf, bw, bh, _G2_BYTES)
+
+    # A 20 W floor stops idle jitter being amplified to fill the panel.
+    pmin, pspan = _series_range((cpu_w_s.hist, gpu_w_s.hist), min_span=20.0)
+    if pmin is not None:
+        # Full-strength colours here: on this panel they are the subject.
+        _plot_series(graph_buf, bw, bh, gpu_w_s.hist, GPU_COL, pmin, pspan)
+        _plot_series(graph_buf, bw, bh, cpu_w_s.hist, CPU_COL, pmin, pspan)
+        _scale_label(graph_buf, bw, bh, pmin, pspan, "W")
+    tft.blit_buffer(memoryview(graph_buf)[:_G2_BYTES], GRAPH_X, G2_Y, bw, bh)
+
+# =========================================================
+# HISTORY BOOKKEEPING
+# =========================================================
+def accumulate(loop_temp):
+    loop_s.add(loop_temp)
+    # Only fold PC values in while the link is alive, so a dead bridge leaves
+    # a gap in the history rather than a flat line at the last known value.
+    if pc_link_fresh():
+        cpu_s.add(pc_cpu)
+        gpu_s.add(pc_gpu)
+        cpu_w_s.add(pc_cpu_w)
+        gpu_w_s.add(pc_gpu_w)
+
+
+def close_bucket():
+    for series in ALL_SERIES:
+        series.close()
+
+
+def _push_live():
+    for series in ALL_SERIES:
+        series.push_live()
+
+
+def _pop_live():
+    for series in ALL_SERIES:
+        series.pop_live()
+
+
+# =========================================================
+# MAIN
+# =========================================================
+def main():
+    global _idle_ms
+
+    draw_static_screen()
+
+    shown = None
+
+    now = time.ticks_ms()
+    last_tick = now
+    next_bucket_ms = time.ticks_add(now, BUCKET_MS)
+    next_graph_ms = now
+
+    while True:
+        poll_pc_link()
+
+        now = time.ticks_ms()
+        # Between two turns of this loop, so always a small number - unlike a
+        # difference against whenever the PC last spoke, which may be days.
+        _idle_ms += time.ticks_diff(now, last_tick)
+        last_tick = now
+
+        if _standby:
+            # A button is the way back when the PC is not coming: the panel
+            # then stays up for another full idle period.
+            if pc_link_fresh() or _wake_pressed():
+                leave_standby()
+        elif _standby_due():
+            enter_standby()
+
+        temp = read_temperature()
+        if temp is not None:
+            shown = temp if shown is None else shown + EMA_ALPHA * (temp - shown)
+            accumulate(temp)
+
+            if not _standby and draw_temperature(shown):
+                tft.blit_buffer(temp_buf, TEMP_BUF_SCREEN_X, TEMP_BUF_SCREEN_Y,
+                                TEMP_BUF_W, TEMP_BUF_H)
+
+        if not _standby and draw_pc_panel():
+            tft.blit_buffer(pc_buf, PC_X, PC_Y, PC_BUF_W, PC_BUF_H)
+
+        now = time.ticks_ms()
+        if time.ticks_diff(now, next_bucket_ms) >= 0:
+            close_bucket()
+            next_bucket_ms = time.ticks_add(next_bucket_ms, BUCKET_MS)
+            if time.ticks_diff(now, next_bucket_ms) >= 0:   # fell behind
+                next_bucket_ms = time.ticks_add(now, BUCKET_MS)
+
+        # The timer is advanced even while dark, so it cannot fall so far
+        # behind that ticks_diff stops meaning anything.
+        if time.ticks_diff(now, next_graph_ms) >= 0:
+            if not _standby:
+                _push_live()
+                try:
+                    draw_temp_graph()
+                    draw_power_graph()
+                finally:
+                    _pop_live()
+            next_graph_ms = time.ticks_add(time.ticks_ms(), GRAPH_PERIOD_MS)
+
+        time.sleep(SAMPLE_PERIOD)
+
+
+main()

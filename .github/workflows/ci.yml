@@ -1,0 +1,78 @@
+name: CI
+
+# Releases are built by release.yml, off tags.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bridge:
+    name: Build bridge
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pc/hwinfo-pico-bridge
+
+      - name: Check formatting
+        working-directory: pc/hwinfo-pico-bridge
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: pc/hwinfo-pico-bridge
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        working-directory: pc/hwinfo-pico-bridge
+        run: cargo test --all-targets
+
+      - name: Build
+        working-directory: pc/hwinfo-pico-bridge
+        run: cargo build --release
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: hwinfo-pico-bridge
+          path: |
+            pc/hwinfo-pico-bridge/target/release/hwinfo-pico-bridge.exe
+            pc/hwinfo-pico-bridge/target/release/hwinfo-pico-bridge-tray.exe
+
+  firmware:
+    name: Check firmware syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Catches syntax errors before they reach a device that can only report
+      # them over a serial console.
+      - name: Compile firmware
+        run: python -m compileall -q firmware
+
+      # The deploy tooling also runs Python on the device: the updater's
+      # helpers, and the prelude embedded in the PowerShell script. Both are
+      # parsed here for the same reason.
+      - name: Compile the device-side deploy helpers
+        run: |
+          python -m compileall -q pc/hwinfo-pico-bridge/src/pico/prelude.py
+          python - <<'PY'
+          import re, pathlib
+          text = pathlib.Path('deploy-pico.ps1').read_text()
+          body = re.search(r"@'\n(.*?)\n'@", text, re.S)
+          assert body, "could not find the here-string prelude in deploy-pico.ps1"
+          compile(body.group(1), 'deploy-pico.ps1 prelude', 'exec')
+          PY

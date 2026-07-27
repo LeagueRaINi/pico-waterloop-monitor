@@ -921,9 +921,12 @@ def draw_power_graph():
     # A 20 W floor stops idle jitter being amplified to fill the panel.
     pmin, pspan = _series_range((cpu_w_s.hist, gpu_w_s.hist), min_span=20.0)
     if pmin is not None:
-        # Full-strength colours here: on this panel they are the subject.
-        _plot_series(graph_buf, bw, bh, gpu_w_s.hist, GPU_COL, pmin, pspan)
-        _plot_series(graph_buf, bw, bh, cpu_w_s.hist, CPU_COL, pmin, pspan)
+        # Same weight and muted colours as the panel above: CPU is CPU on both,
+        # and hairlines carry a spiky series like power better than thick ones.
+        _plot_series(graph_buf, bw, bh, gpu_w_s.hist, GPU_MUTED,
+                     pmin, pspan, half_width=0)
+        _plot_series(graph_buf, bw, bh, cpu_w_s.hist, CPU_MUTED,
+                     pmin, pspan, half_width=0)
         _scale_label(graph_buf, bw, bh, pmin, pspan, "W")
     tft.blit_buffer(memoryview(graph_buf)[:_G2_BYTES], GRAPH_X, G2_Y, bw, bh)
 

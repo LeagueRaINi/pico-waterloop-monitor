@@ -5,6 +5,10 @@ edition = "2021"
 description = "Pushes CPU/GPU temperatures and pump RPM from HWiNFO to the Pico display"
 
 [dependencies]
+# Argument parsing for both front ends. The options they share are declared
+# once, in `cli`, so the help text cannot drift from what is actually accepted
+# and `--install` cannot forget to pass one on.
+clap = { version = "4.6", features = ["derive"] }
 # Serial port open/write plus enumeration with USB VID/PID, which replaces
 # both the hand-rolled DCB setup and the registry walk for finding the Pico.
 serialport = "4.9"

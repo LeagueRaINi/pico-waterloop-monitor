@@ -53,7 +53,7 @@ use, where blanking would just look broken.
 [releases page](../../releases) and extract it anywhere, or build it:
 
 ```bash
-cargo build --release --manifest-path pc/hwinfo-pico-bridge/Cargo.toml
+cargo build --release --manifest-path pc/Cargo.toml
 ```
 
 **3. Copy the firmware to the Pico.** `firmware/` is baked into both binaries, so this
@@ -190,13 +190,17 @@ Constants at the top of [`firmware/main.py`](firmware/main.py):
 ## Notes
 
 `firmware/` is copied to the device root verbatim, which is why the deploy script sits
-outside it. The bridge leans on mainstream crates (`serialport`, `tray-icon`, `winreg`,
-`sha2`, `base64`, `memchr`, `walkdir`, `windows-sys`); the exception is
-[`hwinfo.rs`](pc/hwinfo-pico-bridge/src/hwinfo.rs), which walks HWiNFO's shared memory
-directly because HWiNFO exposes a raw layout rather than an API. That block is *packed*,
-not MSVC-aligned as the published headers suggest, so it strides by the element sizes the
-header reports and decodes only the fixed prefix. Verified against shared memory version 2
-revision 1.
+outside it. `pc/` is a Cargo workspace: `hwinfo` reads HWiNFO's shared memory on its own,
+with no dependency on anything Pico-specific, and is reusable wherever HWiNFO readings are
+wanted by themselves; `hwinfo-pico-bridge-core` is the sensor picking, sampling loop,
+serial transport and firmware updater the two front ends share; `hwinfo-pico-bridge` and
+`hwinfo-pico-bridge-tray` are just their thin `main.rs`. The bridge leans on mainstream
+crates (`serialport`, `tray-icon`, `winreg`, `sha2`, `base64`, `memchr`, `walkdir`,
+`windows-sys`); the exception is [`hwinfo`](pc/hwinfo/src/lib.rs), which walks HWiNFO's
+shared memory directly because HWiNFO exposes a raw layout rather than an API. That block
+is *packed*, not MSVC-aligned as the published headers suggest, so it strides by the
+element sizes the header reports and decodes only the fixed prefix. Verified against
+shared memory version 2 revision 1.
 
 Sensors resolve to table indices once and are rechecked each round: HWiNFO renumbers when
 it rescans or a GPU wakes, and a stale index does not fail — it silently reports another

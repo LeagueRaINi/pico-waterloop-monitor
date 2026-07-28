@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "hwinfo",
+    "hwinfo-pico-bridge-core",
+    "hwinfo-pico-bridge",
+    "hwinfo-pico-bridge-tray",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+# Shared by both binaries: they are small, run at login, and have nothing to
+# gain from a fast build.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

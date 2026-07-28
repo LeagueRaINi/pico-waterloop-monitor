@@ -36,7 +36,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: pc/hwinfo-pico-bridge
+          workspaces: pc
 
       - name: Work out the version
         id: version
@@ -49,11 +49,11 @@ jobs:
       # A tag is not a pull request, so nothing else has necessarily checked
       # this commit. Refusing to ship a build whose tests fail is cheap.
       - name: Test
-        working-directory: pc/hwinfo-pico-bridge
+        working-directory: pc
         run: cargo test --all-targets
 
       - name: Build
-        working-directory: pc/hwinfo-pico-bridge
+        working-directory: pc
         env:
           BRIDGE_VERSION: ${{ steps.version.outputs.value }}
         run: cargo build --release
@@ -64,7 +64,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.value }}
         run: |
           set -euo pipefail
-          bin=pc/hwinfo-pico-bridge/target/release
+          bin=pc/target/release
           name="hwinfo-pico-bridge-$VERSION-windows-x64"
 
           # One folder with everything needed to run, so extracting it

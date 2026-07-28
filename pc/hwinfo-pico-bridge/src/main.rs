@@ -2,12 +2,11 @@
 //! plain foreground run. For always-on use see `hwinfo-pico-bridge-tray`.
 
 use clap::Parser;
-use hwinfo_pico_bridge::autostart;
-use hwinfo_pico_bridge::bridge::{self, Sink, Status};
-use hwinfo_pico_bridge::cli::SensorArgs;
-use hwinfo_pico_bridge::control::Control;
-use hwinfo_pico_bridge::hwinfo::{Reading, ReadingKind, SharedMem};
-use hwinfo_pico_bridge::pico;
+use hwinfo::{Reading, ReadingKind, SharedMem};
+use hwinfo_pico_bridge_core::bridge::{self, Sink, Status};
+use hwinfo_pico_bridge_core::cli::SensorArgs;
+use hwinfo_pico_bridge_core::control::Control;
+use hwinfo_pico_bridge_core::{autostart, pico, BRIDGE_VERSION};
 use std::path::PathBuf;
 
 const AFTER_HELP: &str = "\
@@ -17,7 +16,7 @@ from here, or use its own \"Update Pico\" item, which handles that for you.";
 #[derive(Parser)]
 #[command(
     name = "hwinfo-pico-bridge",
-    version = env!("BRIDGE_VERSION"),
+    version = BRIDGE_VERSION,
     about = "send HWiNFO CPU/GPU temperatures to the Pico display",
     after_help = AFTER_HELP,
 )]

@@ -4,8 +4,8 @@
 //! stops the loop goes through `Control`.
 
 use crate::control::Control;
-use crate::hwinfo::{Reading, ReadingKind, SharedMem};
 use crate::serial;
+use hwinfo::{Reading, ReadingKind, SharedMem};
 use std::time::{Duration, Instant};
 
 /// How long HWiNFO's poll counter may stand still before we assume the

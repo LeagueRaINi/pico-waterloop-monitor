@@ -7,6 +7,7 @@
 
 pub mod autostart;
 pub mod bridge;
+pub mod cli;
 pub mod control;
 pub mod hwinfo;
 pub mod pico;

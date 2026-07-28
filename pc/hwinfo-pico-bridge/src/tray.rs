@@ -69,18 +69,16 @@ pub fn notify(title: &str, text: &str) {
 
 /// A message box is the only way a windows-subsystem binary can say anything,
 /// so keep it for genuinely user-facing messages.
+///
+/// Blocks until dismissed, so it belongs on the UI thread — which is what
+/// `NOTICE` exists to arrange for the worker threads.
 pub fn message_box(title: &str, text: &str) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_OK};
-
-    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
-    unsafe {
-        MessageBoxW(
-            std::ptr::null_mut(),
-            wide(text).as_ptr(),
-            wide(title).as_ptr(),
-            MB_OK,
-        )
-    };
+    rfd::MessageDialog::new()
+        .set_title(title)
+        .set_description(text)
+        .set_level(rfd::MessageLevel::Info)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
 }
 
 // ------------------------------------------------------------------ icon

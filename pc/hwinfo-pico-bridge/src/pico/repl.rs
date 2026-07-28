@@ -44,7 +44,9 @@ pub struct Repl {
 }
 
 impl Repl {
-    pub fn open(name: &str) -> Result<Repl, String> {
+    /// The one entry point that reports a typed error: whether the port was
+    /// merely busy decides what the caller tells the user to do about it.
+    pub fn open(name: &str) -> Result<Repl, crate::serial::Error> {
         // Short enough that `read_until` can check its own, much longer,
         // deadline; long enough that writing a full chunk to a device that is
         // briefly busy is not mistaken for a failure.

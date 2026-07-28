@@ -5,6 +5,10 @@ edition = "2021"
 description = "Pushes CPU/GPU temperatures and pump RPM from HWiNFO to the Pico display"
 
 [dependencies]
+# Argument parsing for both front ends. The options they share are declared
+# once, in `cli`, so the help text cannot drift from what is actually accepted
+# and `--install` cannot forget to pass one on.
+clap = { version = "4.6", features = ["derive"] }
 # Serial port open/write plus enumeration with USB VID/PID, which replaces
 # both the hand-rolled DCB setup and the registry walk for finding the Pico.
 serialport = "4.9"
@@ -15,16 +19,31 @@ winreg = "0.56"
 # Hashing for the firmware updater, so a deploy can tell which files actually
 # changed. Only the PC ever computes these — the Pico just stores them.
 sha2 = "0.10"
+# Rendering those hashes as the hex the manifest and the device speak.
+hex = "0.4"
 # The raw REPL is a text protocol, so file content is base64'd on the way down.
 base64 = "0.22"
 # Substring search over the REPL's response stream.
 memchr = "2.7"
+# Error types for `serial`, where telling a busy port from an absent one has to
+# be a match on a variant rather than a guess at what the OS called it.
+thiserror = "2.0"
 # Walking firmware/ when --firmware names a directory.
 walkdir = "2.5"
+# Reading HWiNFO's shared memory block in place. Lets the layout be written out
+# as structs matching the SDK header instead of a table of byte offsets, with
+# the bounds checks still done for us.
+zerocopy = { version = "0.8", features = ["derive"] }
+# Native message boxes. The tray app is a windows-subsystem binary, so a dialog
+# is the only way it can say anything; this keeps that from being a raw
+# `MessageBoxW` call, and is already what would put the same dialog on a Mac or
+# a Linux desktop.
+rfd = "0.17"
+# Bakes firmware/ into the binaries. `glob` is what walks the nested lib/
+# directories in one expression.
+include_dir = { version = "0.7", features = ["glob"] }
 
-# The same walk again, for the copy baked in at build time.
 [build-dependencies]
-walkdir = "2.5"
 # Microsoft's own Win32 bindings, for the two things the crates above do not
 # cover: mapping HWiNFO's shared memory, and pumping a Windows message loop.
 [dependencies.windows-sys]

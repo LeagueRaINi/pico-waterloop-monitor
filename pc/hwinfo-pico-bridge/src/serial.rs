@@ -11,7 +11,7 @@
 use serialport::{
     DataBits, FlowControl, Parity, SerialPort, SerialPortInfo, SerialPortType, StopBits,
 };
-use std::io::Read;
+use std::io::{self, Read};
 use std::time::Duration;
 
 /// Raspberry Pi Trading / Raspberry Pi Ltd. RP2040 and RP2350 both use this.
@@ -90,14 +90,80 @@ pub fn check_port(name: &str) -> PortCheck {
     PortCheck::Absent
 }
 
-/// Whether an open failed because something else holds the port.
+/// What went wrong talking to a port.
 ///
-/// This goes by the message rather than `err.kind()` on purpose: `serialport`
-/// reports a Windows sharing violation as `NoDevice`, so trusting the kind
-/// tells someone their Pico is unplugged when in fact the bridge — or Thonny —
-/// simply has it open, which is a much more annoying thing to be told.
-pub fn is_busy(message: &str) -> bool {
-    message.to_lowercase().contains("access is denied")
+/// The distinction worth having a type for is `Busy` against `Absent`: telling
+/// someone their Pico is unplugged when in fact Thonny — or the bridge itself —
+/// simply has the port open is a much more annoying thing to be told.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(
+        "could not open {port}: {source} (another program has it open — \
+         Thonny, a serial terminal, or the bridge itself)"
+    )]
+    Busy {
+        port: String,
+        source: serialport::Error,
+    },
+
+    #[error("could not open {port}: {source} (port does not exist)")]
+    Absent {
+        port: String,
+        source: serialport::Error,
+    },
+
+    #[error("could not open {port}: {source}")]
+    Open {
+        port: String,
+        source: serialport::Error,
+    },
+
+    #[error("write to {port} failed: {source}")]
+    Write { port: String, source: io::Error },
+
+    #[error("read from {port} failed: {source}")]
+    Read { port: String, source: io::Error },
+}
+
+impl Error {
+    pub fn is_busy(&self) -> bool {
+        matches!(self, Error::Busy { .. })
+    }
+}
+
+/// Everything upstream of `serial` reports failures as prose, so this is what
+/// lets `?` carry one of these into a `Result<_, String>` unchanged.
+impl From<Error> for String {
+    fn from(err: Error) -> String {
+        err.to_string()
+    }
+}
+
+/// Work out which kind of open failure this was.
+///
+/// `serialport` folds "access denied" and "not found" into a single `NoDevice`
+/// kind, and the only other thing it carries is the OS's own message — which
+/// `FormatMessageW` returns in the user's language, so matching on its text
+/// works on an English Windows and quietly stops working anywhere else. One
+/// more enumeration settles it instead: a port that is still listed exists, so
+/// the open was refused because something else holds it.
+fn classify(name: &str, source: serialport::Error) -> Error {
+    let port = name.to_string();
+    if source.kind() != serialport::ErrorKind::NoDevice {
+        return Error::Open { port, source };
+    }
+    if present(name) {
+        Error::Busy { port, source }
+    } else {
+        Error::Absent { port, source }
+    }
+}
+
+fn present(name: &str) -> bool {
+    serialport::available_ports()
+        .unwrap_or_default()
+        .iter()
+        .any(|p| p.port_name.eq_ignore_ascii_case(name))
 }
 
 pub struct Port {
@@ -106,13 +172,13 @@ pub struct Port {
 }
 
 impl Port {
-    pub fn open(name: &str) -> Result<Port, String> {
+    pub fn open(name: &str) -> Result<Port, Error> {
         Self::open_with_timeout(name, WRITE_TIMEOUT)
     }
 
     /// `timeout` bounds a single read or write, not a whole exchange. The
     /// updater wants it short so it can poll against its own deadline.
-    pub fn open_with_timeout(name: &str, timeout: Duration) -> Result<Port, String> {
+    pub fn open_with_timeout(name: &str, timeout: Duration) -> Result<Port, Error> {
         let inner = serialport::new(name, 115_200)
             .data_bits(DataBits::Eight)
             .parity(Parity::None)
@@ -120,18 +186,7 @@ impl Port {
             .flow_control(FlowControl::None)
             .timeout(timeout)
             .open()
-            .map_err(|err| {
-                let text = err.to_string();
-                let hint = if is_busy(&text) {
-                    " (another program has it open — Thonny, a serial terminal, \
-                      or the bridge itself)"
-                } else if err.kind() == serialport::ErrorKind::NoDevice {
-                    " (port does not exist)"
-                } else {
-                    ""
-                };
-                format!("could not open {name}: {text}{hint}")
-            })?;
+            .map_err(|err| classify(name, err))?;
 
         let mut port = Port {
             inner,
@@ -144,25 +199,31 @@ impl Port {
         Ok(port)
     }
 
-    pub fn write_bytes(&mut self, data: &[u8]) -> Result<(), String> {
+    pub fn write_bytes(&mut self, data: &[u8]) -> Result<(), Error> {
         self.inner
             .write_all(data)
             .and_then(|()| self.inner.flush())
-            .map_err(|err| format!("write to {} failed: {err}", self.name))
+            .map_err(|source| Error::Write {
+                port: self.name.clone(),
+                source,
+            })
     }
 
-    pub fn write_line(&mut self, line: &str) -> Result<(), String> {
+    pub fn write_line(&mut self, line: &str) -> Result<(), Error> {
         self.write_bytes(line.as_bytes())
     }
 
     /// A timed-out read is reported as `Ok(0)`: with USB CDC it just means the
     /// device had nothing to say yet, which callers polling a deadline of their
     /// own do not want to treat as an error.
-    pub fn read_some(&mut self, buf: &mut [u8]) -> Result<usize, String> {
+    pub fn read_some(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         match self.inner.read(buf) {
             Ok(n) => Ok(n),
-            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => Ok(0),
-            Err(err) => Err(format!("read from {} failed: {err}", self.name)),
+            Err(err) if err.kind() == io::ErrorKind::TimedOut => Ok(0),
+            Err(source) => Err(Error::Read {
+                port: self.name.clone(),
+                source,
+            }),
         }
     }
 
@@ -170,5 +231,57 @@ impl Port {
     /// confused with the tail of whatever it was doing beforehand.
     pub fn discard_input(&mut self) {
         let _ = self.inner.clear(serialport::ClearBuffer::Input);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn no_device(description: &str) -> serialport::Error {
+        serialport::Error::new(serialport::ErrorKind::NoDevice, description)
+    }
+
+    #[test]
+    fn a_busy_port_is_told_from_an_absent_one_without_reading_the_message() {
+        // The regression this exists for: `FormatMessageW` returns the OS
+        // message in the user's language, so matching it for "access is
+        // denied" worked on an English Windows and quietly stopped working
+        // anywhere else. Whatever the description says, a name that is not in
+        // the enumeration belongs to no port.
+        let err = classify("COM_NOT_A_REAL_PORT", no_device("Zugriff verweigert"));
+        assert!(matches!(err, Error::Absent { .. }), "{err}");
+        assert!(!err.is_busy());
+    }
+
+    #[test]
+    fn a_failure_that_is_not_about_the_device_is_left_alone() {
+        let source = serialport::Error::new(serialport::ErrorKind::InvalidInput, "bad baud");
+        let err = classify("COM7", source);
+        assert!(matches!(err, Error::Open { .. }), "{err}");
+        assert!(!err.is_busy());
+    }
+
+    #[test]
+    fn each_open_failure_says_what_to_do_about_it() {
+        let busy = Error::Busy {
+            port: "COM7".to_string(),
+            source: no_device("Access is denied."),
+        };
+        assert!(busy.is_busy());
+        assert!(
+            busy.to_string().contains("another program has it open"),
+            "{busy}"
+        );
+
+        let absent = Error::Absent {
+            port: "COM7".to_string(),
+            source: no_device("The system cannot find the file specified."),
+        };
+        assert!(!absent.is_busy());
+        assert!(
+            absent.to_string().contains("port does not exist"),
+            "{absent}"
+        );
     }
 }

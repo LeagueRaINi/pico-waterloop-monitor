@@ -1,16 +1,27 @@
 //! What gets copied to the device: either the copy baked in at build time or a
 //! directory named with `--firmware`.
 
+use include_dir::{include_dir, Dir};
 use std::borrow::Cow;
 use std::path::Path;
 use walkdir::WalkDir;
 
-include!(concat!(env!("OUT_DIR"), "/firmware.rs"));
+/// The copy baked in at build time. A build with no `firmware/` beside it fails
+/// to compile rather than producing a binary that cannot deploy.
+static EMBEDDED: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../firmware");
 
 /// Build products of a local `python -m compileall`, which CI runs over
 /// `firmware/`. They are not firmware and must not reach the device.
 fn skip(name: &str) -> bool {
     name == "__pycache__" || name.starts_with('.') || name.ends_with(".pyc")
+}
+
+/// The same rule over a whole relative path. `include_dir!` embeds everything
+/// it finds — it has no filter of its own — so anything a local `compileall`
+/// left behind is dropped here instead of at build time.
+fn skip_path(path: &Path) -> bool {
+    path.components()
+        .any(|part| skip(&part.as_os_str().to_string_lossy()))
 }
 
 pub struct SourceFile {
@@ -81,12 +92,21 @@ pub fn load(dir: Option<&Path>) -> Result<Vec<SourceFile>, String> {
             read_dir(dir)?
         }
         None => {
-            let mut files = Vec::with_capacity(EMBEDDED.len());
-            for (path, data) in EMBEDDED {
-                check_path(path)?;
+            let entries = EMBEDDED
+                .find("**/*")
+                .map_err(|e| format!("cannot read the baked-in firmware: {e}"))?;
+            let mut files = Vec::new();
+            for file in entries.filter_map(|entry| entry.as_file()) {
+                if skip_path(file.path()) {
+                    continue;
+                }
+                // The macro normalises separators, so this is already the
+                // device path.
+                let path = file.path().to_string_lossy().replace('\\', "/");
+                check_path(&path)?;
                 files.push(SourceFile {
-                    path: (*path).to_string(),
-                    data: Cow::Borrowed(*data),
+                    path,
+                    data: Cow::Borrowed(file.contents()),
                 });
             }
             files
@@ -122,6 +142,7 @@ pub fn directories(files: &[SourceFile]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn rejects_paths_that_could_escape_or_break_a_python_literal() {
@@ -159,12 +180,46 @@ mod tests {
     }
 
     #[test]
-    fn the_baked_in_copy_is_usable() {
-        // A build without firmware/ next to it is legitimate, but if there is
-        // one it has to survive the same checks a --firmware directory does.
-        let files = load(None);
-        if let Ok(files) = files {
-            assert!(files.iter().any(|f| f.path == "main.py"));
-        }
+    fn the_baked_in_copy_is_byte_for_byte_the_firmware_directory() {
+        // `include_dir!` will not compile without firmware/ beside the crate,
+        // so this can be unconditional. What it is really checking is that the
+        // macro reaches the nested lib/ directories and lands on exactly what
+        // a --firmware pointed at the same place would send — the two paths
+        // have to stay interchangeable, or a deploy would depend on which one
+        // the user happened to use.
+        let embedded = load(None).expect("firmware/ is part of the repo");
+        let on_disk = load(Some(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../firmware"),
+        ))
+        .expect("the same directory, read at runtime");
+
+        let describe = |files: &[SourceFile]| -> Vec<(String, usize)> {
+            files
+                .iter()
+                .map(|f| (f.path.clone(), f.data.len()))
+                .collect()
+        };
+        assert_eq!(describe(&embedded), describe(&on_disk));
+
+        assert!(embedded.iter().any(|f| f.path == "main.py"));
+        assert!(
+            embedded.iter().any(|f| f.path == "lib/st7789/st7789py.py"),
+            "the nested directories have to be reached: {:?}",
+            embedded.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn compiled_python_never_reaches_the_device() {
+        // include_dir! embeds whatever is there, so this filter is the only
+        // thing keeping a local `python -m compileall` off the Pico.
+        assert!(skip_path(Path::new(
+            "lib/__pycache__/st7789py.cpython-312.pyc"
+        )));
+        assert!(skip_path(Path::new("__pycache__")));
+        assert!(skip_path(Path::new("main.pyc")));
+        assert!(skip_path(Path::new(".gitignore")));
+        assert!(!skip_path(Path::new("lib/st7789/st7789py.py")));
+        assert!(!skip_path(Path::new("main.py")));
     }
 }

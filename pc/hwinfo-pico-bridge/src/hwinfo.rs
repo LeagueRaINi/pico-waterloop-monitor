@@ -18,33 +18,10 @@ use windows_sys::Win32::System::Memory::{
     MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, VirtualQuery, FILE_MAP_READ,
     MEMORY_BASIC_INFORMATION, MEM_COMMIT,
 };
+use zerocopy::{FromBytes, Immutable, KnownLayout};
 
 const SHM_NAME: &str = "Global\\HWiNFO_SENS_SM2";
-const SIGNATURE: &[u8; 4] = b"HWiS";
-
-// Header field offsets (packed, 44 bytes total).
-const H_POLL_TIME: usize = 12;
-const H_OFF_SENSORS: usize = 20;
-const H_SIZE_SENSOR: usize = 24;
-const H_NUM_SENSORS: usize = 28;
-const H_OFF_READINGS: usize = 32;
-const H_SIZE_READING: usize = 36;
-const H_NUM_READINGS: usize = 40;
-const HEADER_SIZE: usize = 44;
-
-// Sensor element: fixed prefix is 264 bytes.
-const S_NAME_ORIG: usize = 8;
-const S_NAME_USER: usize = 136;
-const SENSOR_FIXED: usize = 264;
-
-// Reading element: fixed prefix is 316 bytes.
-const R_TYPE: usize = 0;
-const R_SENSOR_INDEX: usize = 4;
-const R_LABEL_ORIG: usize = 12;
-const R_LABEL_USER: usize = 140;
-const R_UNIT: usize = 268;
-const R_VALUE: usize = 284;
-const READING_FIXED: usize = 316;
+const SIGNATURE: [u8; 4] = *b"HWiS";
 
 const STRING_LEN: usize = 128;
 const UNIT_LEN: usize = 16;
@@ -52,6 +29,68 @@ const UNIT_LEN: usize = 16;
 pub const READING_TYPE_TEMPERATURE: u32 = 1;
 pub const READING_TYPE_FAN: u32 = 3;
 pub const READING_TYPE_POWER: u32 = 5;
+
+/// The three structures HWiNFO publishes, as the SDK header describes them.
+///
+/// Every field is byte-aligned — the integers are `zerocopy`'s little-endian
+/// wrappers and the strings are byte arrays — so `repr(C)` lays these out with
+/// no padding, matching the packed block on the wire without needing
+/// `repr(packed)` and the unaligned-reference problems that come with it.
+/// Little-endian is stated rather than assumed, which is also what the previous
+/// `from_le_bytes` calls did.
+mod layout {
+    use zerocopy::byteorder::little_endian::{F64, I64, U32};
+    use zerocopy::{FromBytes, Immutable, KnownLayout};
+
+    #[derive(FromBytes, KnownLayout, Immutable)]
+    #[repr(C)]
+    pub struct Header {
+        pub signature: [u8; 4],
+        pub version: U32,
+        pub revision: U32,
+        pub poll_time: I64,
+        pub offset_sensors: U32,
+        pub size_sensor: U32,
+        pub num_sensors: U32,
+        pub offset_readings: U32,
+        pub size_reading: U32,
+        pub num_readings: U32,
+    }
+
+    /// Only the fixed prefix. Recent HWiNFO builds append UTF-8 copies of the
+    /// strings after it, which is why the walk strides by the size the header
+    /// reports rather than by `size_of` this.
+    #[derive(FromBytes, KnownLayout, Immutable)]
+    #[repr(C)]
+    pub struct Sensor {
+        pub id: U32,
+        pub instance: U32,
+        pub name_orig: [u8; super::STRING_LEN],
+        pub name_user: [u8; super::STRING_LEN],
+    }
+
+    #[derive(FromBytes, KnownLayout, Immutable)]
+    #[repr(C)]
+    pub struct Reading {
+        pub kind: U32,
+        pub sensor_index: U32,
+        pub id: U32,
+        pub label_orig: [u8; super::STRING_LEN],
+        pub label_user: [u8; super::STRING_LEN],
+        pub unit: [u8; super::UNIT_LEN],
+        pub value: F64,
+        pub value_min: F64,
+        pub value_max: F64,
+        pub value_avg: F64,
+    }
+}
+
+use layout::{Header, Sensor};
+
+/// The sizes the header must report at least, or this is not a layout we know.
+const HEADER_SIZE: usize = std::mem::size_of::<Header>();
+const SENSOR_FIXED: usize = std::mem::size_of::<Sensor>();
+const READING_FIXED: usize = std::mem::size_of::<layout::Reading>();
 
 pub struct Reading {
     pub sensor: String,
@@ -142,59 +181,38 @@ impl SharedMem {
         Some(unsafe { std::slice::from_raw_parts(self.base.add(offset), len) })
     }
 
-    fn u32_at(&self, offset: usize) -> Option<u32> {
-        let b = self.bytes_at(offset, 4)?;
-        Some(u32::from_le_bytes(b.try_into().ok()?))
+    /// One of the `layout` structures, read in place. `None` means the element
+    /// would run past the end of the mapped view.
+    fn struct_at<T: FromBytes + KnownLayout + Immutable>(&self, offset: usize) -> Option<&T> {
+        let bytes = self.bytes_at(offset, std::mem::size_of::<T>())?;
+        T::ref_from_prefix(bytes).ok().map(|(value, _rest)| value)
     }
 
-    fn i64_at(&self, offset: usize) -> Option<i64> {
-        let b = self.bytes_at(offset, 8)?;
-        Some(i64::from_le_bytes(b.try_into().ok()?))
-    }
-
-    fn f64_at(&self, offset: usize) -> Option<f64> {
-        let b = self.bytes_at(offset, 8)?;
-        Some(f64::from_le_bytes(b.try_into().ok()?))
-    }
-
-    /// HWiNFO writes these as single-byte characters (0xB0 for the degree
-    /// sign), i.e. Latin-1 rather than UTF-8.
-    fn string_at(&self, offset: usize, max_len: usize) -> String {
-        let Some(raw) = self.bytes_at(offset, max_len) else {
-            return String::new();
-        };
-        let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
-        raw[..end]
-            .iter()
-            .map(|&b| b as char)
-            .collect::<String>()
-            .trim()
-            .to_string()
+    fn header(&self) -> Option<&Header> {
+        self.struct_at::<Header>(0)
     }
 
     /// True while the block still belongs to a live HWiNFO instance. It flips
     /// to "DEAD" on shutdown, and a restarted HWiNFO creates a *new* section,
     /// leaving ours frozen — which the caller detects via `poll_time`.
     pub fn is_valid(&self) -> bool {
-        self.bytes_at(0, 4) == Some(SIGNATURE.as_slice())
+        self.header()
+            .is_some_and(|header| header.signature == SIGNATURE)
     }
 
     pub fn poll_time(&self) -> i64 {
-        self.i64_at(H_POLL_TIME).unwrap_or(0)
+        self.header().map_or(0, |header| header.poll_time.get())
     }
 
     pub fn read_all(&self) -> Result<Vec<Reading>, String> {
-        if !self.is_valid() {
+        let Some(header) = self.header().filter(|h| h.signature == SIGNATURE) else {
             return Err("HWiNFO shared memory went away".into());
-        }
+        };
 
-        let get = |off: usize| self.u32_at(off).unwrap_or(0) as usize;
-        let off_sensors = get(H_OFF_SENSORS);
-        let size_sensor = get(H_SIZE_SENSOR);
-        let num_sensors = get(H_NUM_SENSORS);
-        let off_readings = get(H_OFF_READINGS);
-        let size_reading = get(H_SIZE_READING);
-        let num_readings = get(H_NUM_READINGS);
+        let off_sensors = header.offset_sensors.get() as usize;
+        let size_sensor = header.size_sensor.get() as usize;
+        let off_readings = header.offset_readings.get() as usize;
+        let size_reading = header.size_reading.get() as usize;
 
         if size_sensor < SENSOR_FIXED || size_reading < READING_FIXED {
             return Err(format!(
@@ -210,47 +228,60 @@ impl SharedMem {
         // Cap them at what the mapped view could physically hold — the element
         // walk below is bounds checked anyway, so this only has to be sane.
         let fits = |offset: usize, stride: usize| self.len.saturating_sub(offset) / stride;
-        let num_sensors = num_sensors.min(fits(off_sensors, size_sensor));
-        let num_readings = num_readings.min(fits(off_readings, size_reading));
+        let num_sensors = (header.num_sensors.get() as usize).min(fits(off_sensors, size_sensor));
+        let num_readings =
+            (header.num_readings.get() as usize).min(fits(off_readings, size_reading));
 
         let mut sensors = Vec::with_capacity(num_sensors);
         for i in 0..num_sensors {
-            let base = off_sensors + i * size_sensor;
-            let user = self.string_at(base + S_NAME_USER, STRING_LEN);
-            let name = if user.is_empty() {
-                self.string_at(base + S_NAME_ORIG, STRING_LEN)
-            } else {
-                user
+            let Some(sensor) = self.struct_at::<Sensor>(off_sensors + i * size_sensor) else {
+                break;
             };
-            sensors.push(name);
+            sensors.push(preferred(&sensor.name_user, &sensor.name_orig));
         }
 
         let mut readings = Vec::with_capacity(num_readings);
         for i in 0..num_readings {
-            let base = off_readings + i * size_reading;
-            let Some(kind) = self.u32_at(base + R_TYPE) else {
-                break;
-            };
-            let sensor_index = self.u32_at(base + R_SENSOR_INDEX).unwrap_or(0) as usize;
-            let user = self.string_at(base + R_LABEL_USER, STRING_LEN);
-            let label = if user.is_empty() {
-                self.string_at(base + R_LABEL_ORIG, STRING_LEN)
-            } else {
-                user
-            };
-            let Some(value) = self.f64_at(base + R_VALUE) else {
+            let Some(raw) = self.struct_at::<layout::Reading>(off_readings + i * size_reading)
+            else {
                 break;
             };
             readings.push(Reading {
-                sensor: sensors.get(sensor_index).cloned().unwrap_or_default(),
-                label,
-                unit: self.string_at(base + R_UNIT, UNIT_LEN),
-                value,
-                kind,
+                sensor: sensors
+                    .get(raw.sensor_index.get() as usize)
+                    .cloned()
+                    .unwrap_or_default(),
+                label: preferred(&raw.label_user, &raw.label_orig),
+                unit: latin1(&raw.unit),
+                value: raw.value.get(),
+                kind: raw.kind.get(),
             });
         }
         Ok(readings)
     }
+}
+
+/// HWiNFO lets the user rename anything; the original is what it shipped with.
+fn preferred(user: &[u8], original: &[u8]) -> String {
+    let user = latin1(user);
+    if user.is_empty() {
+        latin1(original)
+    } else {
+        user
+    }
+}
+
+/// HWiNFO writes these as single-byte characters (0xB0 for the degree sign),
+/// i.e. Latin-1 rather than UTF-8 — which is exactly what casting each byte to
+/// `char` decodes.
+fn latin1(raw: &[u8]) -> String {
+    let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+    raw[..end]
+        .iter()
+        .map(|&b| b as char)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 impl Drop for SharedMem {
@@ -267,5 +298,69 @@ impl Drop for SharedMem {
                 CloseHandle(self.mapping);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{offset_of, size_of};
+
+    /// The offsets the struct definitions replaced, kept as a test.
+    ///
+    /// Nothing at runtime would notice a field of the wrong width: the walk
+    /// would simply read the next one's bytes and report a plausible-looking
+    /// wrong number. These are the values verified against HWiNFO64 shared
+    /// memory version 2, revision 1.
+    #[test]
+    fn the_header_is_laid_out_where_hwinfo_puts_it() {
+        assert_eq!(size_of::<Header>(), 44);
+        assert_eq!(offset_of!(Header, signature), 0);
+        assert_eq!(offset_of!(Header, poll_time), 12);
+        assert_eq!(offset_of!(Header, offset_sensors), 20);
+        assert_eq!(offset_of!(Header, size_sensor), 24);
+        assert_eq!(offset_of!(Header, num_sensors), 28);
+        assert_eq!(offset_of!(Header, offset_readings), 32);
+        assert_eq!(offset_of!(Header, size_reading), 36);
+        assert_eq!(offset_of!(Header, num_readings), 40);
+    }
+
+    #[test]
+    fn a_sensor_element_is_laid_out_where_hwinfo_puts_it() {
+        assert_eq!(size_of::<Sensor>(), 264, "fixed prefix");
+        assert_eq!(offset_of!(Sensor, name_orig), 8);
+        assert_eq!(offset_of!(Sensor, name_user), 136);
+    }
+
+    #[test]
+    fn a_reading_element_is_laid_out_where_hwinfo_puts_it() {
+        assert_eq!(size_of::<layout::Reading>(), 316, "fixed prefix");
+        assert_eq!(offset_of!(layout::Reading, kind), 0);
+        assert_eq!(offset_of!(layout::Reading, sensor_index), 4);
+        assert_eq!(offset_of!(layout::Reading, label_orig), 12);
+        assert_eq!(offset_of!(layout::Reading, label_user), 140);
+        assert_eq!(offset_of!(layout::Reading, unit), 268);
+        assert_eq!(offset_of!(layout::Reading, value), 284);
+    }
+
+    #[test]
+    fn strings_are_decoded_as_latin1_and_stop_at_the_terminator() {
+        // 0xB0 is the degree sign HWiNFO puts in a temperature's unit. As UTF-8
+        // that byte is not a character at all.
+        assert_eq!(latin1(b"\xb0C\0junk after the terminator"), "°C");
+        assert_eq!(latin1(b"  CPU Package  \0"), "CPU Package", "trimmed");
+        assert_eq!(latin1(b"\0"), "");
+        assert_eq!(latin1(b"no terminator"), "no terminator");
+    }
+
+    #[test]
+    fn a_renamed_sensor_wins_over_the_original() {
+        assert_eq!(
+            preferred(b"Water Loop\0", b"Nuvoton NCT6798D\0"),
+            "Water Loop"
+        );
+        assert_eq!(preferred(b"\0", b"Nuvoton NCT6798D\0"), "Nuvoton NCT6798D");
+        // A name of nothing but spaces trims to empty, so it is not a rename.
+        assert_eq!(preferred(b"   \0", b"Original\0"), "Original");
     }
 }

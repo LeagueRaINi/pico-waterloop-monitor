@@ -580,6 +580,7 @@ pub fn run(config: &Config, sink: &dyn Sink, control: &Control) -> Result<(), St
                                 port_error_shown = false;
                             }
                             Err(err) => {
+                                let err = err.to_string();
                                 if !port_error_shown {
                                     sink.error(&err);
                                     port_error_shown = true;
@@ -614,6 +615,7 @@ pub fn run(config: &Config, sink: &dyn Sink, control: &Control) -> Result<(), St
 
             if let Some(p) = &mut port {
                 if let Err(err) = p.write_line(&line) {
+                    let err = err.to_string();
                     sink.error(&format!("{err}; will reconnect"));
                     port = None;
                     port_error_shown = false;

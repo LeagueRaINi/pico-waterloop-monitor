@@ -130,11 +130,7 @@ impl Summary {
 
 fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    let mut hex = String::with_capacity(64);
-    for byte in Sha256::digest(data) {
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
+    hex::encode(Sha256::digest(data))
 }
 
 // ------------------------------------------------------------------- device
@@ -162,10 +158,10 @@ fn connect(opts: &Options, report: &dyn Fn(&str)) -> Result<Repl, String> {
 
 fn open_repl(port: &str, report: &dyn Fn(&str)) -> Result<Repl, String> {
     let mut repl = Repl::open(port).map_err(|err| {
-        if crate::serial::is_busy(&err) {
+        if err.is_busy() {
             format!("{err}\n{BUSY_HINT}")
         } else {
-            err
+            err.to_string()
         }
     })?;
     report("interrupting main.py and entering the raw REPL");

@@ -9,8 +9,11 @@ description = "Reads HWiNFO's \"Shared Memory Support\" block (HWiNFO_SENS_SM2) 
 # as structs matching the SDK header instead of a table of byte offsets, with
 # the bounds checks still done for us.
 zerocopy = { version = "0.8", features = ["derive"] }
-# Microsoft's own Win32 bindings, for mapping the named shared-memory section.
+# Microsoft's own Win32 bindings, for mapping the named shared-memory section
+# and holding HWiNFO's own mutex around it while reading.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
     "Win32_System_Memory",
+    "Win32_System_Threading",
 ] }

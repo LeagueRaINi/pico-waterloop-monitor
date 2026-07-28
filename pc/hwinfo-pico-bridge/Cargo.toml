@@ -25,6 +25,9 @@ hex = "0.4"
 base64 = "0.22"
 # Substring search over the REPL's response stream.
 memchr = "2.7"
+# Error types for `serial`, where telling a busy port from an absent one has to
+# be a match on a variant rather than a guess at what the OS called it.
+thiserror = "2.0"
 # Walking firmware/ when --firmware names a directory.
 walkdir = "2.5"
 

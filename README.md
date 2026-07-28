@@ -4,7 +4,7 @@ A Raspberry Pi Pico with a Waveshare Pico LCD 2 (320×240, ST7789) showing custo
 coolant temperature from an NTC thermistor, alongside CPU and GPU hotspot temperatures,
 power and pump RPM pulled from HWiNFO on the PC.
 
-![The display mounted in a PC, showing coolant temperature above a 30-minute temperature
+![The display mounted in a PC, showing coolant temperature above a 15-minute temperature
 graph and a CPU/GPU power graph](docs/display.jpg)
 
 ## Why
@@ -19,20 +19,21 @@ so a small Windows program pushes HWiNFO's readings down the same cable.
 
 ## What it shows
 
-Two panels over a shared 30-minute clock, 10-second buckets, newest pinned to the right.
+Two panels over a shared 15-minute clock, 5-second buckets, newest pinned to the right.
 
 - **Temperatures** — coolant, CPU and GPU. Two scales: silicon down the left, coolant down
   the right in its own colour, so a couple of degrees of water is not squashed flat by tens
-  of degrees of silicon. Coolant is the thicker line.
+  of degrees of silicon. Where coolant crosses a silicon line it blends into it rather
+  than covering it.
 - **Power** — CPU package and GPU board power, directly below on the same time axis, so
   load and its effect on the water line up vertically.
 
 CPU and GPU labels carry their trace colours, so neither graph needs a legend. Pump RPM
 turns red below 300. With no PC link the coolant half still works and the PC rows grey out.
 
-After ten minutes without PC data the panel goes dark — the backlight is what ages here
+After five minutes without PC data the panel goes dark — the backlight is what ages here
 and most of what the board draws. Sampling carries on while it is off, so waking shows a
-real half hour rather than an empty graph. PC data returning wakes it, as does any of the
+real 15 minutes rather than an empty graph. PC data returning wakes it, as does any of the
 four buttons. A Pico that has *never* heard from a PC is left alone: that is standalone
 use, where blanking would just look broken.
 

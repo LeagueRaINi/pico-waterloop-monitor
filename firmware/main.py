@@ -57,20 +57,20 @@ GPU_MUTED  = st7789.color565(88, 76, 150)
 STALE      = st7789.color565(90, 96, 105)
 
 # =========================================================
-# TIMEBASE  —  30 minute rolling window
+# TIMEBASE  —  15 minute rolling window
 #
 # Sampling stays fast so the big number reacts, but samples are averaged into
 # BUCKET_SECONDS-wide buckets; one bucket is one plotted point.
 # =========================================================
-WINDOW_SECONDS  = 30 * 60                            # 1800 s of history
+WINDOW_SECONDS  = 15 * 60                            # 900 s of history
 HISTORY_POINTS  = 180                                # points across the graph
-BUCKET_SECONDS  = WINDOW_SECONDS / HISTORY_POINTS    # 10 s per point
+BUCKET_SECONDS  = WINDOW_SECONDS / HISTORY_POINTS    # 5 s per point
 BUCKET_MS       = int(BUCKET_SECONDS * 1000)
 
 SAMPLE_PERIOD   = 0.25          # ADC / big number update period
 GRAPH_PERIOD_MS = 2000          # graph panel redraw period
 PC_TIMEOUT_MS   = 8000          # no serial data for this long -> "NO DATA"
-STANDBY_AFTER_MS = 10 * 60 * 1000   # dark after this long unlinked; 0 disables
+STANDBY_AFTER_MS = 5 * 60 * 1000    # dark after this long unlinked; 0 disables
 
 # =========================================================
 # LAYOUT (320 x 240)
@@ -548,7 +548,7 @@ def pc_link_fresh():
 # backlight is what ages, and it is most of what the board draws, so there is
 # no reason to run it while the PC it reports on is asleep.
 #
-# Sampling carries on while dark, so waking shows a real half hour of history
+# Sampling carries on while dark, so waking shows a real 15 minutes of history
 # rather than an empty graph.
 # =========================================================
 try:
@@ -760,7 +760,7 @@ def _latest(data):
 _PLOT_GAP = 0xFFFF          # no data for this column; break the line
 _PLOT_YS = array('H', bytearray(GRAPH_W * 2))
 _PLOT_COLS = array('H', bytearray(GRAPH_W * 2))
-_PLOT_META = array('i', bytearray(5 * 4))   # bw, bh, start_px, count, half_width
+_PLOT_META = array('i', bytearray(7 * 4))  # bw, bh, start_px, count, half_width, bg1, bg2
 
 
 @micropython.viper
@@ -805,8 +805,87 @@ def _plot_run(buf: ptr16, ys: ptr16, cols: ptr16, meta: ptr32):
         i = i + 1
 
 
-def _plot_series(buf, bw, bh, data, color, tmin, span, half_width=1):
-    """`color` is either a 565 value or a function of the sample value."""
+@micropython.viper
+def _plot_run_blend(buf: ptr16, ys: ptr16, cols: ptr16, meta: ptr32):
+    """
+    Same joined-line draw as `_plot_run`, for a series drawn on top of others
+    that share its pixel rows - two independent scales share the same panel
+    height, so a column can belong to more than one trace.
+
+    A pixel that already holds plain panel background (`meta[5]`) or grid
+    (`meta[6]`) draws solid, exactly as `_plot_run` would. Anything else is
+    something another trace already put there, and is blended rather than
+    replaced, so it keeps reading through the row(s) this line covers instead
+    of vanishing under them.
+    """
+    buf_w = int(meta[0])
+    buf_h = int(meta[1])
+    start = int(meta[2])
+    count = int(meta[3])
+    half = int(meta[4])
+    # Stored pixels are byte-swapped (see `_fill16`); swap the two background
+    # colours once here rather than un-swapping every pixel read below.
+    bg1 = int(meta[5])
+    bg1 = ((bg1 & 0xFF) << 8) | ((bg1 >> 8) & 0xFF)
+    bg2 = int(meta[6])
+    bg2 = ((bg2 & 0xFF) << 8) | ((bg2 >> 8) & 0xFF)
+
+    prev = -1
+    i = 0
+    while i < count:
+        py = int(ys[i])
+        if py == 0xFFFF:
+            prev = -1
+        else:
+            top = py - half
+            bot = py + half
+            if prev >= 0:
+                if prev - half < top:
+                    top = prev - half
+                if prev + half > bot:
+                    bot = prev + half
+            if top < 0:
+                top = 0
+            if bot > buf_h - 1:
+                bot = buf_h - 1
+            color = int(cols[i])
+            value = ((color & 0xFF) << 8) | ((color >> 8) & 0xFF)
+            fr = (color >> 11) & 0x1F
+            fg = (color >> 5) & 0x3F
+            fb = color & 0x1F
+            index = top * buf_w + start + i
+            n = bot - top + 1
+            while n > 0:
+                existing = int(buf[index])
+                if existing == bg1 or existing == bg2:
+                    buf[index] = value
+                else:
+                    # An even split - clearly a blend, not just a tint,
+                    # since a hairline is only ever one or two pixels wide
+                    # here and a subtler mix was too easy to miss.
+                    ex = ((existing & 0xFF) << 8) | ((existing >> 8) & 0xFF)
+                    er = (ex >> 11) & 0x1F
+                    eg = (ex >> 5) & 0x3F
+                    eb = ex & 0x1F
+                    nr = (er + fr) >> 1
+                    ng = (eg + fg) >> 1
+                    nb = (eb + fb) >> 1
+                    blended = (nr << 11) | (ng << 5) | nb
+                    buf[index] = ((blended & 0xFF) << 8) | ((blended >> 8) & 0xFF)
+                index = index + buf_w
+                n = n - 1
+            prev = py
+        i = i + 1
+
+
+def _plot_series(buf, bw, bh, data, color, tmin, span, half_width=1, blend_bg=None):
+    """
+    `color` is either a 565 value or a function of the sample value.
+
+    `blend_bg` is `(panel_color, grid_color)` for a series drawn where
+    another one may already be - see `_plot_run_blend`. `None` (the default)
+    draws solid, as every series but the coolant one does.
+    """
     tinted = callable(color)
     n = len(data)
     if n < 1:
@@ -856,7 +935,11 @@ def _plot_series(buf, bw, bh, data, color, tmin, span, half_width=1):
     meta[2] = start_px
     meta[3] = count
     meta[4] = half_width
-    _plot_run(buf, ys, cols, meta)
+    if blend_bg is None:
+        _plot_run(buf, ys, cols, meta)
+    else:
+        meta[5], meta[6] = blend_bg
+        _plot_run_blend(buf, ys, cols, meta)
 
 
 def _scale_label(buf, bw, bh, tmin, span, unit, color=TEXT_DIM, right=False):
@@ -887,6 +970,11 @@ def draw_temp_graph():
     turned down: the silicon is hairline and muted, and the horizontal grid is
     dropped - with two scales in play those lines corresponded to neither, so
     they were decoration that happened to look like information.
+
+    Coolant is now the same weight as the other two, rather than the thicker
+    line it used to be: where it crosses a silicon trace it blends into it
+    rather than erasing it, and a thinner line means a shorter overlap for
+    that to happen over in the first place.
     """
     bw, bh = GRAPH_W, G1_H
     _graph_background(graph_buf, bw, bh, _G1_BYTES, hlines=False)
@@ -901,11 +989,9 @@ def draw_temp_graph():
         _plot_series(graph_buf, bw, bh, cpu_s.hist, CPU_MUTED,
                      si_min, si_span, half_width=0)
         _scale_label(graph_buf, bw, bh, si_min, si_span, "C")
-    # Coolant is thicker rather than area-filled: a fill under two other
-    # traces muddies them, so weight marks the primary series instead.
     if lo_min is not None:
         _plot_series(graph_buf, bw, bh, loop_s.hist, temp_color,
-                     lo_min, lo_span, half_width=1)
+                     lo_min, lo_span, half_width=0, blend_bg=(PANEL, GRID))
         newest = _latest(loop_s.hist)
         _scale_label(graph_buf, bw, bh, lo_min, lo_span, "C",
                      temp_color(newest) if newest is not None else NORMAL,

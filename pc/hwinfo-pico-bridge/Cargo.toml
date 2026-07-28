@@ -30,6 +30,10 @@ memchr = "2.7"
 thiserror = "2.0"
 # Walking firmware/ when --firmware names a directory.
 walkdir = "2.5"
+# Reading HWiNFO's shared memory block in place. Lets the layout be written out
+# as structs matching the SDK header instead of a table of byte offsets, with
+# the bounds checks still done for us.
+zerocopy = { version = "0.8", features = ["derive"] }
 
 # The same walk again, for the copy baked in at build time.
 [build-dependencies]

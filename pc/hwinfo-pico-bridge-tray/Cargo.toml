@@ -1,14 +1,13 @@
 [package]
-name = "hwinfo-pico-bridge"
+name = "hwinfo-pico-bridge-tray"
 version.workspace = true
 edition.workspace = true
-description = "Console front end: sensor listing, firmware deployment and diagnostics"
+description = "Silent front end with a tray icon: what runs at login"
 
 [[bin]]
-name = "hwinfo-pico-bridge"
+name = "hwinfo-pico-bridge-tray"
 path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
-hwinfo = { path = "../hwinfo" }
 hwinfo-pico-bridge-core = { path = "../hwinfo-pico-bridge-core" }

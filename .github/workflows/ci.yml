@@ -23,30 +23,30 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: pc/hwinfo-pico-bridge
+          workspaces: pc
 
       - name: Check formatting
-        working-directory: pc/hwinfo-pico-bridge
+        working-directory: pc
         run: cargo fmt --check
 
       - name: Clippy
-        working-directory: pc/hwinfo-pico-bridge
+        working-directory: pc
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
-        working-directory: pc/hwinfo-pico-bridge
+        working-directory: pc
         run: cargo test --all-targets
 
       - name: Build
-        working-directory: pc/hwinfo-pico-bridge
+        working-directory: pc
         run: cargo build --release
 
       - uses: actions/upload-artifact@v5
         with:
           name: hwinfo-pico-bridge
           path: |
-            pc/hwinfo-pico-bridge/target/release/hwinfo-pico-bridge.exe
-            pc/hwinfo-pico-bridge/target/release/hwinfo-pico-bridge-tray.exe
+            pc/target/release/hwinfo-pico-bridge.exe
+            pc/target/release/hwinfo-pico-bridge-tray.exe
 
   firmware:
     name: Check firmware syntax
@@ -68,7 +68,7 @@ jobs:
       # parsed here for the same reason.
       - name: Compile the device-side deploy helpers
         run: |
-          python -m compileall -q pc/hwinfo-pico-bridge/src/pico/prelude.py
+          python -m compileall -q pc/hwinfo-pico-bridge-core/src/pico/prelude.py
           python - <<'PY'
           import re, pathlib
           text = pathlib.Path('deploy-pico.ps1').read_text()

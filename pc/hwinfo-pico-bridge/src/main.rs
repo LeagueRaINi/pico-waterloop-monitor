@@ -2,12 +2,11 @@
 //! plain foreground run. For always-on use see `hwinfo-pico-bridge-tray`.
 
 use clap::Parser;
-use hwinfo_pico_bridge::autostart;
-use hwinfo_pico_bridge::bridge::{self, Sink, Status};
-use hwinfo_pico_bridge::cli::SensorArgs;
-use hwinfo_pico_bridge::control::Control;
-use hwinfo_pico_bridge::hwinfo::{Reading, SharedMem};
-use hwinfo_pico_bridge::pico;
+use hwinfo::{Reading, ReadingKind, SharedMem};
+use hwinfo_pico_bridge_core::bridge::{self, Sink, Status};
+use hwinfo_pico_bridge_core::cli::SensorArgs;
+use hwinfo_pico_bridge_core::control::Control;
+use hwinfo_pico_bridge_core::{autostart, pico, BRIDGE_VERSION};
 use std::path::PathBuf;
 
 const AFTER_HELP: &str = "\
@@ -17,7 +16,7 @@ from here, or use its own \"Update Pico\" item, which handles that for you.";
 #[derive(Parser)]
 #[command(
     name = "hwinfo-pico-bridge",
-    version = env!("BRIDGE_VERSION"),
+    version = BRIDGE_VERSION,
     about = "send HWiNFO CPU/GPU temperatures to the Pico display",
     after_help = AFTER_HELP,
 )]
@@ -124,7 +123,12 @@ fn report(line: &str) {
 }
 
 fn list_sensors(readings: &[Reading]) {
-    let listed = |r: &Reading| r.is_temperature() || r.is_fan() || r.is_power();
+    let listed = |r: &Reading| {
+        matches!(
+            r.kind,
+            ReadingKind::Temperature | ReadingKind::Fan | ReadingKind::Power
+        )
+    };
     let width = readings
         .iter()
         .filter(|r| listed(r))
@@ -139,7 +143,7 @@ fn list_sensors(readings: &[Reading]) {
         if !listed(r) {
             continue;
         }
-        let value = if r.is_temperature() {
+        let value = if r.kind == ReadingKind::Temperature {
             format!("{:.1}", r.value)
         } else {
             format!("{:.0}", r.value)

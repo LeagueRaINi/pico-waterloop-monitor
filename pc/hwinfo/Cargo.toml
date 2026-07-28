@@ -1,0 +1,16 @@
+[package]
+name = "hwinfo"
+version.workspace = true
+edition.workspace = true
+description = "Reads HWiNFO's \"Shared Memory Support\" block (HWiNFO_SENS_SM2) directly, with no HWiNFO SDK or mature upstream crate to depend on"
+
+[dependencies]
+# Reading HWiNFO's shared memory block in place. Lets the layout be written out
+# as structs matching the SDK header instead of a table of byte offsets, with
+# the bounds checks still done for us.
+zerocopy = { version = "0.8", features = ["derive"] }
+# Microsoft's own Win32 bindings, for mapping the named shared-memory section.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+] }

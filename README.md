@@ -4,7 +4,7 @@ A Raspberry Pi Pico with a Waveshare Pico LCD 2 (320×240, ST7789) showing custo
 coolant temperature from an NTC thermistor, alongside CPU and GPU hotspot temperatures,
 power and pump RPM pulled from HWiNFO on the PC.
 
-![The display mounted in a PC, showing coolant temperature above a 30-minute temperature
+![The display mounted in a PC, showing coolant temperature above a 15-minute temperature
 graph and a CPU/GPU power graph](docs/display.jpg)
 
 ## Why
@@ -19,20 +19,21 @@ so a small Windows program pushes HWiNFO's readings down the same cable.
 
 ## What it shows
 
-Two panels over a shared 30-minute clock, 10-second buckets, newest pinned to the right.
+Two panels over a shared 15-minute clock, 5-second buckets, newest pinned to the right.
 
 - **Temperatures** — coolant, CPU and GPU. Two scales: silicon down the left, coolant down
   the right in its own colour, so a couple of degrees of water is not squashed flat by tens
-  of degrees of silicon. Coolant is the thicker line.
+  of degrees of silicon. Where coolant crosses a silicon line it blends into it rather
+  than covering it.
 - **Power** — CPU package and GPU board power, directly below on the same time axis, so
   load and its effect on the water line up vertically.
 
 CPU and GPU labels carry their trace colours, so neither graph needs a legend. Pump RPM
 turns red below 300. With no PC link the coolant half still works and the PC rows grey out.
 
-After ten minutes without PC data the panel goes dark — the backlight is what ages here
+After five minutes without PC data the panel goes dark — the backlight is what ages here
 and most of what the board draws. Sampling carries on while it is off, so waking shows a
-real half hour rather than an empty graph. PC data returning wakes it, as does any of the
+real 15 minutes rather than an empty graph. PC data returning wakes it, as does any of the
 four buttons. A Pico that has *never* heard from a PC is left alone: that is standalone
 use, where blanking would just look broken.
 
@@ -53,7 +54,7 @@ use, where blanking would just look broken.
 [releases page](../../releases) and extract it anywhere, or build it:
 
 ```bash
-cargo build --release --manifest-path pc/hwinfo-pico-bridge/Cargo.toml
+cargo build --release --manifest-path pc/Cargo.toml
 ```
 
 **3. Copy the firmware to the Pico.** `firmware/` is baked into both binaries, so this
@@ -190,13 +191,17 @@ Constants at the top of [`firmware/main.py`](firmware/main.py):
 ## Notes
 
 `firmware/` is copied to the device root verbatim, which is why the deploy script sits
-outside it. The bridge leans on mainstream crates (`serialport`, `tray-icon`, `winreg`,
-`sha2`, `base64`, `memchr`, `walkdir`, `windows-sys`); the exception is
-[`hwinfo.rs`](pc/hwinfo-pico-bridge/src/hwinfo.rs), which walks HWiNFO's shared memory
-directly because HWiNFO exposes a raw layout rather than an API. That block is *packed*,
-not MSVC-aligned as the published headers suggest, so it strides by the element sizes the
-header reports and decodes only the fixed prefix. Verified against shared memory version 2
-revision 1.
+outside it. `pc/` is a Cargo workspace: `hwinfo` reads HWiNFO's shared memory on its own,
+with no dependency on anything Pico-specific, and is reusable wherever HWiNFO readings are
+wanted by themselves; `hwinfo-pico-bridge-core` is the sensor picking, sampling loop,
+serial transport and firmware updater the two front ends share; `hwinfo-pico-bridge` and
+`hwinfo-pico-bridge-tray` are just their thin `main.rs`. The bridge leans on mainstream
+crates (`serialport`, `tray-icon`, `winreg`, `sha2`, `base64`, `memchr`, `walkdir`,
+`windows-sys`); the exception is [`hwinfo`](pc/hwinfo/src/lib.rs), which walks HWiNFO's
+shared memory directly because HWiNFO exposes a raw layout rather than an API. That block
+is *packed*, not MSVC-aligned as the published headers suggest, so it strides by the
+element sizes the header reports and decodes only the fixed prefix. Verified against
+shared memory version 2 revision 1.
 
 Sensors resolve to table indices once and are rechecked each round: HWiNFO renumbers when
 it rescans or a GPU wakes, and a stale index does not fail — it silently reports another

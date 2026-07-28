@@ -5,11 +5,10 @@
 //! icon, and can pause itself and update the Pico's firmware from the menu.
 
 use clap::Parser;
-use hwinfo_pico_bridge::bridge::{self, Sink, Status};
-use hwinfo_pico_bridge::cli::SensorArgs;
-use hwinfo_pico_bridge::control::Control;
-use hwinfo_pico_bridge::pico;
-use hwinfo_pico_bridge::tray;
+use hwinfo_pico_bridge_core::bridge::{self, Sink, Status};
+use hwinfo_pico_bridge_core::cli::SensorArgs;
+use hwinfo_pico_bridge_core::control::Control;
+use hwinfo_pico_bridge_core::{pico, tray, BRIDGE_VERSION};
 use std::sync::Arc;
 
 const AFTER_HELP: &str = "\
@@ -29,7 +28,7 @@ device, pausing and resuming around it on its own.";
     // Both binaries are one package, so the name has to be given or each would
     // report the other's.
     name = "hwinfo-pico-bridge-tray",
-    version = env!("BRIDGE_VERSION"),
+    version = BRIDGE_VERSION,
     about = "run the HWiNFO bridge in the background with a tray icon",
     after_help = AFTER_HELP,
     // Everything this binary says arrives in a message box, which would render

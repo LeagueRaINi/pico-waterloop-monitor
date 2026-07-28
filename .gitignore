@@ -1,5 +1,5 @@
 # Rust
-/pc/hwinfo-pico-bridge/target/
+/pc/target/
 
 # MicroPython / Python
 __pycache__/

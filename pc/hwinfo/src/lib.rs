@@ -18,16 +18,44 @@
 //! the ones a particular caller happens to want today — come out fully typed,
 //! and lets the parsing be tested against a byte buffer built by hand, with
 //! no HWiNFO instance and no shared-memory mapping required.
+//!
+//! Reads are synchronized against HWiNFO's own mutex (`Global\HWiNFO_SM2_MUTEX`)
+//! where it publishes one — see `MUTEX_NAME` on why that matters for a block
+//! this loosely aligned.
 
 use std::ffi::c_void;
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0,
+};
+use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::System::Memory::{
     MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, VirtualQuery, FILE_MAP_READ,
     MEMORY_BASIC_INFORMATION, MEM_COMMIT,
 };
+use windows_sys::Win32::System::Threading::{OpenMutexW, ReleaseMutex, WaitForSingleObject};
 
 const SHM_NAME: &str = "Global\\HWiNFO_SENS_SM2";
 const SIGNATURE: [u8; 4] = *b"HWiS";
+
+/// HWiNFO's own mutex around the block, held while it writes an update.
+///
+/// The block is packed rather than naturally aligned (see the module doc),
+/// so an in-place multi-byte write — an `f64` reading, say — is not atomic at
+/// the hardware level. A read landing mid-write can see a torn value: some
+/// bytes from the old one, some from the new. Holding this for the duration
+/// of a read is what rules that out.
+///
+/// Best-effort: not every HWiNFO build is known to publish this, and a
+/// `SharedMem` still works without it — reads are simply unsynchronized, as
+/// every read here was before this existed.
+const MUTEX_NAME: &str = "Global\\HWiNFO_SM2_MUTEX";
+
+/// How long to wait for the mutex before reading anyway.
+///
+/// HWiNFO holds it only for the writes themselves — microseconds — so this is
+/// generous on purpose; it exists to bound the wait against a mutex whose
+/// owner has gone away rather than to ever actually be reached in normal use.
+const LOCK_TIMEOUT_MS: u32 = 200;
 
 const STRING_LEN: usize = 128;
 const UNIT_LEN: usize = 16;
@@ -332,6 +360,9 @@ fn wide(s: &str) -> Vec<u16> {
 
 pub struct SharedMem {
     mapping: HANDLE,
+    /// May be null: not every HWiNFO build is known to publish this, and a
+    /// null handle just means [`SharedMem::locked`] skips locking entirely.
+    mutex: HANDLE,
     base: *const u8,
     len: usize,
 }
@@ -354,6 +385,10 @@ impl SharedMem {
             return Err(format!("could not map HWiNFO shared memory (error {err})"));
         }
 
+        // Best-effort: a build that does not publish this mutex is not an
+        // error, just a `SharedMem` that reads unsynchronized.
+        let mutex = unsafe { OpenMutexW(SYNCHRONIZE, 0, wide(MUTEX_NAME).as_ptr()) };
+
         // Ask the OS how big the view actually is, so every read can be bounds
         // checked against something we did not get from the block itself.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -372,6 +407,7 @@ impl SharedMem {
 
         let shm = SharedMem {
             mapping,
+            mutex,
             base: view.Value as *const u8,
             len,
         };
@@ -393,15 +429,39 @@ impl SharedMem {
         unsafe { std::slice::from_raw_parts(self.base, self.len) }
     }
 
+    /// Run `f` over the mapped bytes while holding HWiNFO's own mutex, if it
+    /// published one — see [`MUTEX_NAME`].
+    ///
+    /// Never blocks longer than [`LOCK_TIMEOUT_MS`]: a read racing an update
+    /// is still no worse than every read here before this existed, so a
+    /// timeout falls through to reading anyway rather than stalling the
+    /// caller over a mutex whose owner may have gone away. `WAIT_ABANDONED`
+    /// means exactly that happened — HWiNFO died mid-write — and Windows has
+    /// already handed us ownership, so it is released the same as a clean
+    /// acquisition.
+    fn locked<T>(&self, f: impl FnOnce(&[u8]) -> T) -> T {
+        if self.mutex.is_null() {
+            return f(self.as_bytes());
+        }
+        let wait = unsafe { WaitForSingleObject(self.mutex, LOCK_TIMEOUT_MS) };
+        let result = f(self.as_bytes());
+        if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
+            unsafe { ReleaseMutex(self.mutex) };
+        }
+        result
+    }
+
     /// True while the block still belongs to a live HWiNFO instance. It flips
     /// to "DEAD" on shutdown, and a restarted HWiNFO creates a *new* section,
     /// leaving ours frozen — which the caller detects via `poll_time`.
     pub fn is_valid(&self) -> bool {
-        parse::header(self.as_bytes()).is_some_and(|header| header.signature == SIGNATURE)
+        self.locked(|bytes| {
+            parse::header(bytes).is_some_and(|header| header.signature == SIGNATURE)
+        })
     }
 
     pub fn poll_time(&self) -> i64 {
-        parse::header(self.as_bytes()).map_or(0, |header| header.poll_time.get())
+        self.locked(|bytes| parse::header(bytes).map_or(0, |header| header.poll_time.get()))
     }
 
     /// Every sensor HWiNFO is publishing, with no readings attached. Cheaper
@@ -409,12 +469,11 @@ impl SharedMem {
     /// what devices are present, or to resolve `sensor_id`/`sensor_instance`
     /// without decoding every reading too.
     pub fn sensors(&self) -> Result<Vec<SensorInfo>, String> {
-        let bytes = self.as_bytes();
-        parse::sensors(bytes, parse::header_checked(bytes)?)
+        self.locked(|bytes| parse::sensors(bytes, parse::header_checked(bytes)?))
     }
 
     pub fn read_all(&self) -> Result<Vec<Reading>, String> {
-        parse::read_all(self.as_bytes())
+        self.locked(parse::read_all)
     }
 }
 
@@ -430,6 +489,9 @@ impl Drop for SharedMem {
             }
             if !self.mapping.is_null() {
                 CloseHandle(self.mapping);
+            }
+            if !self.mutex.is_null() {
+                CloseHandle(self.mutex);
             }
         }
     }

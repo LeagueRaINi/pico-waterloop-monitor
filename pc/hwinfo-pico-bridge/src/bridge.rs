@@ -4,9 +4,7 @@
 //! stops the loop goes through `Control`.
 
 use crate::control::Control;
-use crate::hwinfo::{
-    Reading, SharedMem, READING_TYPE_FAN, READING_TYPE_POWER, READING_TYPE_TEMPERATURE,
-};
+use crate::hwinfo::{Reading, ReadingKind, SharedMem};
 use crate::serial;
 use std::time::{Duration, Instant};
 
@@ -119,7 +117,7 @@ pub trait Sink {
 /// Index of the best matching reading of the given type.
 pub fn pick(
     readings: &[Reading],
-    kind: u32,
+    kind: ReadingKind,
     exact_labels: &[&str],
     keyword: &str,
     explicit: Option<&str>,
@@ -179,7 +177,7 @@ pub fn pick(
 #[derive(Clone)]
 struct Choice {
     idx: usize,
-    kind: u32,
+    kind: ReadingKind,
     sensor: String,
     label: String,
 }
@@ -187,7 +185,7 @@ struct Choice {
 impl Choice {
     fn resolve(
         readings: &[Reading],
-        kind: u32,
+        kind: ReadingKind,
         labels: &[&str],
         keyword: &str,
         explicit: Option<&str>,
@@ -230,27 +228,27 @@ struct Picks {
 
 impl Picks {
     fn resolve(readings: &[Reading], config: &Config) -> Picks {
-        let temp = READING_TYPE_TEMPERATURE;
+        let temp = ReadingKind::Temperature;
         Picks {
             cpu: Choice::resolve(readings, temp, CPU_LABELS, "cpu", config.cpu.as_deref()),
             gpu: Choice::resolve(readings, temp, GPU_LABELS, "gpu", config.gpu.as_deref()),
             pump: Choice::resolve(
                 readings,
-                READING_TYPE_FAN,
+                ReadingKind::Fan,
                 PUMP_LABELS,
                 "pump",
                 config.pump.as_deref(),
             ),
             cpu_power: Choice::resolve(
                 readings,
-                READING_TYPE_POWER,
+                ReadingKind::Power,
                 CPU_POWER_LABELS,
                 "cpu",
                 config.cpu_power.as_deref(),
             ),
             gpu_power: Choice::resolve(
                 readings,
-                READING_TYPE_POWER,
+                ReadingKind::Power,
                 GPU_POWER_LABELS,
                 "gpu",
                 config.gpu_power.as_deref(),

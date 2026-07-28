@@ -26,9 +26,32 @@ const SIGNATURE: [u8; 4] = *b"HWiS";
 const STRING_LEN: usize = 128;
 const UNIT_LEN: usize = 16;
 
-pub const READING_TYPE_TEMPERATURE: u32 = 1;
-pub const READING_TYPE_FAN: u32 = 3;
-pub const READING_TYPE_POWER: u32 = 5;
+/// What a reading measures.
+///
+/// HWiNFO publishes many more types than these — voltages, clocks, usage,
+/// currents — and the display has no use for any of them, so they arrive as
+/// `Other` rather than being enumerated.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadingKind {
+    Temperature,
+    Fan,
+    Power,
+    Other(u32),
+}
+
+impl ReadingKind {
+    /// The type codes as HWiNFO writes them into the `SENSOR_READING_TYPE`
+    /// field. A data-carrying variant rules out `#[repr(u32)]` discriminants,
+    /// so the mapping is spelled out here.
+    fn from_raw(raw: u32) -> ReadingKind {
+        match raw {
+            1 => ReadingKind::Temperature,
+            3 => ReadingKind::Fan,
+            5 => ReadingKind::Power,
+            other => ReadingKind::Other(other),
+        }
+    }
+}
 
 /// The three structures HWiNFO publishes, as the SDK header describes them.
 ///
@@ -97,21 +120,7 @@ pub struct Reading {
     pub label: String,
     pub unit: String,
     pub value: f64,
-    pub kind: u32,
-}
-
-impl Reading {
-    pub fn is_temperature(&self) -> bool {
-        self.kind == READING_TYPE_TEMPERATURE
-    }
-
-    pub fn is_fan(&self) -> bool {
-        self.kind == READING_TYPE_FAN
-    }
-
-    pub fn is_power(&self) -> bool {
-        self.kind == READING_TYPE_POWER
-    }
+    pub kind: ReadingKind,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -254,7 +263,7 @@ impl SharedMem {
                 label: preferred(&raw.label_user, &raw.label_orig),
                 unit: latin1(&raw.unit),
                 value: raw.value.get(),
-                kind: raw.kind.get(),
+                kind: ReadingKind::from_raw(raw.kind.get()),
             });
         }
         Ok(readings)
@@ -341,6 +350,19 @@ mod tests {
         assert_eq!(offset_of!(layout::Reading, label_user), 140);
         assert_eq!(offset_of!(layout::Reading, unit), 268);
         assert_eq!(offset_of!(layout::Reading, value), 284);
+    }
+
+    #[test]
+    fn the_reading_type_codes_are_the_ones_hwinfo_publishes() {
+        // These used to be named constants; the match is now the only place
+        // the numbers live, so this is what pins them.
+        assert_eq!(ReadingKind::from_raw(1), ReadingKind::Temperature);
+        assert_eq!(ReadingKind::from_raw(3), ReadingKind::Fan);
+        assert_eq!(ReadingKind::from_raw(5), ReadingKind::Power);
+        // Voltage, current, clock, usage and the rest: carried through rather
+        // than enumerated, so an unknown type is never mistaken for a known one.
+        assert_eq!(ReadingKind::from_raw(2), ReadingKind::Other(2));
+        assert_eq!(ReadingKind::from_raw(0), ReadingKind::Other(0));
     }
 
     #[test]

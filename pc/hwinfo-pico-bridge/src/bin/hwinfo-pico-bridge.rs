@@ -6,7 +6,7 @@ use hwinfo_pico_bridge::autostart;
 use hwinfo_pico_bridge::bridge::{self, Sink, Status};
 use hwinfo_pico_bridge::cli::SensorArgs;
 use hwinfo_pico_bridge::control::Control;
-use hwinfo_pico_bridge::hwinfo::{Reading, SharedMem};
+use hwinfo_pico_bridge::hwinfo::{Reading, ReadingKind, SharedMem};
 use hwinfo_pico_bridge::pico;
 use std::path::PathBuf;
 
@@ -124,7 +124,12 @@ fn report(line: &str) {
 }
 
 fn list_sensors(readings: &[Reading]) {
-    let listed = |r: &Reading| r.is_temperature() || r.is_fan() || r.is_power();
+    let listed = |r: &Reading| {
+        matches!(
+            r.kind,
+            ReadingKind::Temperature | ReadingKind::Fan | ReadingKind::Power
+        )
+    };
     let width = readings
         .iter()
         .filter(|r| listed(r))
@@ -139,7 +144,7 @@ fn list_sensors(readings: &[Reading]) {
         if !listed(r) {
             continue;
         }
-        let value = if r.is_temperature() {
+        let value = if r.kind == ReadingKind::Temperature {
             format!("{:.1}", r.value)
         } else {
             format!("{:.0}", r.value)

@@ -34,10 +34,16 @@ walkdir = "2.5"
 # as structs matching the SDK header instead of a table of byte offsets, with
 # the bounds checks still done for us.
 zerocopy = { version = "0.8", features = ["derive"] }
+# Native message boxes. The tray app is a windows-subsystem binary, so a dialog
+# is the only way it can say anything; this keeps that from being a raw
+# `MessageBoxW` call, and is already what would put the same dialog on a Mac or
+# a Linux desktop.
+rfd = "0.17"
+# Bakes firmware/ into the binaries. `glob` is what walks the nested lib/
+# directories in one expression.
+include_dir = { version = "0.7", features = ["glob"] }
 
-# The same walk again, for the copy baked in at build time.
 [build-dependencies]
-walkdir = "2.5"
 # Microsoft's own Win32 bindings, for the two things the crates above do not
 # cover: mapping HWiNFO's shared memory, and pumping a Windows message loop.
 [dependencies.windows-sys]

@@ -130,11 +130,7 @@ impl Summary {
 
 fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    let mut hex = String::with_capacity(64);
-    for byte in Sha256::digest(data) {
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
+    hex::encode(Sha256::digest(data))
 }
 
 // ------------------------------------------------------------------- device

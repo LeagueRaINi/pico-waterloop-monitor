@@ -19,6 +19,8 @@ winreg = "0.56"
 # Hashing for the firmware updater, so a deploy can tell which files actually
 # changed. Only the PC ever computes these — the Pico just stores them.
 sha2 = "0.10"
+# Rendering those hashes as the hex the manifest and the device speak.
+hex = "0.4"
 # The raw REPL is a text protocol, so file content is base64'd on the way down.
 base64 = "0.22"
 # Substring search over the REPL's response stream.

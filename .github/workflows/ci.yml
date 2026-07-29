@@ -11,8 +11,43 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Each job below only checks one part of the tree, so there is no reason
+  # to run it - and wait on a Windows runner for the Rust one - when a PR
+  # or push touches neither. `if: needs.changes.outputs.<x> == 'true'` on a
+  # job (not `paths:` on the trigger) is what keeps this a required check
+  # branch protection can still see and mark passed, rather than a run
+  # that silently never starts.
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    # paths-filter needs this to list a pull request's changed files via the
+    # API; the push-triggered path below instead diffs the local checkout.
+    permissions:
+      pull-requests: read
+    outputs:
+      bridge: ${{ steps.filter.outputs.bridge }}
+      firmware: ${{ steps.filter.outputs.firmware }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            bridge:
+              - 'pc/**'
+              - '.github/workflows/ci.yml'
+            firmware:
+              - 'firmware/**'
+              - 'pc/hwinfo-pico-bridge-core/src/pico/prelude.py'
+              - '.github/workflows/ci.yml'
+
   bridge:
     name: Build bridge
+    needs: changes
+    if: needs.changes.outputs.bridge == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -50,6 +85,8 @@ jobs:
 
   firmware:
     name: Check firmware syntax
+    needs: changes
+    if: needs.changes.outputs.firmware == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

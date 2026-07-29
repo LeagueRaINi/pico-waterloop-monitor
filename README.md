@@ -4,8 +4,20 @@ A Raspberry Pi Pico with a Waveshare Pico LCD 2 (320×240, ST7789) showing custo
 coolant temperature from an NTC thermistor, alongside CPU and GPU hotspot temperatures,
 power and pump RPM pulled from HWiNFO on the PC.
 
-![The display mounted in a PC, showing coolant temperature above a 15-minute temperature
-graph and a CPU/GPU power graph](docs/display.jpg)
+![Rendered preview of the display: coolant temperature, CPU/GPU/pump readout, a
+dual-scale temperature graph and a power graph](docs/preview.png)
+
+The image above is rendered straight from the firmware by
+[`tools/render_preview.py`](tools/render_preview.py) — same drawing code and font
+rasteriser as the device, run against synthetic data on desktop Python with only the
+SPI/GPIO calls stubbed out — so it can't drift from what's actually on the panel. It
+lives outside `firmware/` because the Rust bridge's `include_dir!` copies that whole
+directory to the device verbatim. Re-run it after any display change:
+
+```bash
+pip install pillow
+python tools/render_preview.py
+```
 
 ## Why
 
@@ -117,8 +129,7 @@ power rather than chip power, since the coolant sees everything the card dissipa
 AMD, `CPU (Tctl/Tdie)` **is** the hotspot; `CPU IOD Hotspot` is deliberately not preferred.
 
 Only one program can hold the serial port, so pause the tray app before deploying from the
-console — or use its **Update Pico** item, which does that for you. `deploy-pico.ps1` does
-the same job from a bare PowerShell prompt with nothing built.
+console — or use its **Update Pico** item, which does that for you.
 
 ## Updating the firmware
 

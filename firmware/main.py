@@ -75,14 +75,14 @@ STANDBY_AFTER_MS = 5 * 60 * 1000    # dark after this long unlinked; 0 disables
 # =========================================================
 # LAYOUT (320 x 240)
 # =========================================================
-TEMP_X, TEMP_Y     = 14, 8
+TEMP_X, TEMP_Y     = 8, 8
 TEMP_BUF_W         = 88         # big number + degree marker, no trend arrow
 TEMP_BUF_H         = 40
 TEMP_INSET_Y       = 4
 TEMP_BUF_SCREEN_X  = TEMP_X
 TEMP_BUF_SCREEN_Y  = TEMP_Y - TEMP_INSET_Y
 
-LABEL_X, LABEL_Y   = 16, 48     # static "COOLANT" caption
+LABEL_X, LABEL_Y   = 10, 48     # static "COOLANT" caption
 
 # CPU / GPU / PUMP readouts in three columns: label, temperature, watts.
 # There is no separate link indicator - when PC data goes stale every row
@@ -92,21 +92,26 @@ LABEL_X, LABEL_Y   = 16, 48     # static "COOLANT" caption
 # the column, which is what sets the widths below: four characters for the
 # middle column to fit a pump RPM, three for watts. Temperatures are whole
 # degrees here; only the big coolant number keeps its decimal.
+#
+# The inter-column gaps are trimmed to the minimum that still keeps each
+# group legible (down to 1px around the single-character units, which carry
+# a colour change of their own to separate them) so the row's right edge
+# lands in the same place the graphs below do, instead of running to the
+# physical screen edge.
 PC_X, PC_Y         = 112, 6
-PC_BUF_W           = 208
+PC_BUF_W           = 200
 PC_BUF_H           = 58
-PC_COL_VALUE       = 68         # temperature / pump, clear of the 4-char "PUMP"
-PC_COL_VALUE_UNIT  = 134
-PC_COL_WATTS       = 150
-PC_COL_WATTS_UNIT  = 200
+PC_COL_VALUE       = 66         # temperature / pump, clear of the 4-char "PUMP"
+PC_COL_VALUE_UNIT  = 131
+PC_COL_WATTS       = 143
+PC_COL_WATTS_UNIT  = 192
 PC_UNIT_DY         = 4          # centres the 8px unit against the 16px value
 PC_ROW_Y           = (0, 21, 42)
 PUMP_MIN_RPM       = 300        # below this the pump is considered stalled
 
-GRAPH_X            = 14
-GRAPH_W            = 292
-# One graph for every temperature, one for power. Removing the footer and
-# merging the two temperature panels bought 26px of graph height.
+GRAPH_X            = 8          # matches the coolant number's left edge
+GRAPH_W            = 304        # both margins are 8px, same as the PC panel's right edge
+# One graph for every temperature, one for power.
 G1_Y,  G1_H        = 72,  76    # coolant + cpu + gpu, dual scale
 G2_Y,  G2_H        = 160, 74    # cpu + gpu power
 
@@ -333,18 +338,19 @@ def _buf_text(buf, font, string, x, y, fg, bg, buf_w, buf_h):
         cx += fw
 
 
-def _buf_text_on_backing(buf, font, string, x, y, fg, backing, buf_w, buf_h):
+def _buf_text_halo(buf, font, string, x, y, fg, halo, buf_w, buf_h):
     """
-    Text over a cleared rectangle, for labels that sit inside a graph.
+    Text with a 1px halo instead of an opaque backing rectangle.
 
-    Labels are drawn after the traces, so a line crossing one would otherwise
-    tangle with the glyph strokes and leave neither readable. Outlining each
-    stroke would hide less of the data, but costs far more per frame.
+    Labels are drawn after the traces, so a line crossing one would
+    otherwise tangle with the glyph strokes and leave neither readable. A
+    halo touches only the pixels immediately around each stroke - four
+    extra glyph draws (offset up/down/left/right, transparent background)
+    before the real one - rather than blanking a whole rectangle that
+    would sit there whether or not a trace was actually underneath.
     """
-    height = font.HEIGHT
-    width = len(string) * font.WIDTH
-    for row in range(y - 1, y + height + 1):
-        _buf_hline(buf, x - 1, row, width + 2, backing, buf_w, buf_h)
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        _buf_text(buf, font, string, x + dx, y + dy, halo, None, buf_w, buf_h)
     _buf_text(buf, font, string, x, y, fg, None, buf_w, buf_h)
 
 # =========================================================
@@ -814,9 +820,13 @@ def _plot_run_blend(buf: ptr16, ys: ptr16, cols: ptr16, meta: ptr32):
 
     A pixel that already holds plain panel background (`meta[5]`) or grid
     (`meta[6]`) draws solid, exactly as `_plot_run` would. Anything else is
-    something another trace already put there, and is blended rather than
-    replaced, so it keeps reading through the row(s) this line covers instead
-    of vanishing under them.
+    something another trace already put there. Rather than replace it
+    outright, or split the colour evenly with it, the pixel is weighted 3:1
+    toward this line - a single crossing still visibly blends into the
+    other trace, but a run of columns where the two exactly coincide (a
+    flat silicon reading under a flat coolant one, say) keeps reading as
+    this line's own colour instead of settling into a flat, third colour
+    that belongs to neither and reads as this line having stopped.
     """
     buf_w = int(meta[0])
     buf_h = int(meta[1])
@@ -860,16 +870,15 @@ def _plot_run_blend(buf: ptr16, ys: ptr16, cols: ptr16, meta: ptr32):
                 if existing == bg1 or existing == bg2:
                     buf[index] = value
                 else:
-                    # An even split - clearly a blend, not just a tint,
-                    # since a hairline is only ever one or two pixels wide
-                    # here and a subtler mix was too easy to miss.
+                    # 3:1 toward this line's colour - see the docstring for
+                    # why an even split does not stay legible.
                     ex = ((existing & 0xFF) << 8) | ((existing >> 8) & 0xFF)
                     er = (ex >> 11) & 0x1F
                     eg = (ex >> 5) & 0x3F
                     eb = ex & 0x1F
-                    nr = (er + fr) >> 1
-                    ng = (eg + fg) >> 1
-                    nb = (eb + fb) >> 1
+                    nr = (fr * 3 + er) >> 2
+                    ng = (fg * 3 + eg) >> 2
+                    nb = (fb * 3 + eb) >> 2
                     blended = (nr << 11) | (ng << 5) | nb
                     buf[index] = ((blended & 0xFF) << 8) | ((blended >> 8) & 0xFF)
                 index = index + buf_w
@@ -942,17 +951,21 @@ def _plot_series(buf, bw, bh, data, color, tmin, span, half_width=1, blend_bg=No
         _plot_run_blend(buf, ys, cols, meta)
 
 
-def _scale_label(buf, bw, bh, tmin, span, unit, color=TEXT_DIM, right=False):
+def _scale_labels(buf, bw, bh, tmin, span, unit, color=TEXT_DIM, right=False):
     """
-    One compact "low-high" label per scale, in the top corner.
+    High and low value of a scale, at the top and bottom edge respectively.
 
-    A number at each end of each scale meant four figures scattered around a
-    panel that already carries three traces. This says the same thing in one
-    place per scale, with the unit on the end so the panel needs no caption.
+    The label doubles as the scale's axis this way: the number at a given
+    edge is what the trace touching that edge means, with no separate
+    lookup between a number and the height it describes.
     """
-    text = "{:.0f}-{:.0f}{}".format(tmin, tmin + span, unit)
-    x = (bw - 3 - len(text) * font_small.WIDTH) if right else 3
-    _buf_text_on_backing(buf, font_small, text, x, 2, color, PANEL, bw, bh)
+    hi_text = "{:.0f}{}".format(tmin + span, unit)
+    lo_text = "{:.0f}{}".format(tmin, unit)
+    hi_x = (bw - 2 - len(hi_text) * font_small.WIDTH) if right else 2
+    lo_x = (bw - 2 - len(lo_text) * font_small.WIDTH) if right else 2
+    _buf_text_halo(buf, font_small, hi_text, hi_x, 1, color, PANEL, bw, bh)
+    _buf_text_halo(buf, font_small, lo_text, lo_x, bh - font_small.HEIGHT - 1,
+                   color, PANEL, bw, bh)
 
 
 def draw_temp_graph():
@@ -971,10 +984,9 @@ def draw_temp_graph():
     dropped - with two scales in play those lines corresponded to neither, so
     they were decoration that happened to look like information.
 
-    Coolant is now the same weight as the other two, rather than the thicker
-    line it used to be: where it crosses a silicon trace it blends into it
-    rather than erasing it, and a thinner line means a shorter overlap for
-    that to happen over in the first place.
+    Coolant is the same weight as the other two rather than a thicker line,
+    so where it crosses a silicon trace it blends into it instead of
+    erasing it - a thin line keeps that overlap short to begin with.
     """
     bw, bh = GRAPH_W, G1_H
     _graph_background(graph_buf, bw, bh, _G1_BYTES, hlines=False)
@@ -988,12 +1000,18 @@ def draw_temp_graph():
                      si_min, si_span, half_width=0)
         _plot_series(graph_buf, bw, bh, cpu_s.hist, CPU_MUTED,
                      si_min, si_span, half_width=0)
-        _scale_label(graph_buf, bw, bh, si_min, si_span, "C")
     if lo_min is not None:
         _plot_series(graph_buf, bw, bh, loop_s.hist, temp_color,
                      lo_min, lo_span, half_width=0, blend_bg=(PANEL, GRID))
+
+    # Labels last, after every trace - drawing order is what keeps the
+    # halo legible, since a line plotted on top of it would poke straight
+    # through the gaps between strokes.
+    if si_min is not None:
+        _scale_labels(graph_buf, bw, bh, si_min, si_span, "C")
+    if lo_min is not None:
         newest = _latest(loop_s.hist)
-        _scale_label(graph_buf, bw, bh, lo_min, lo_span, "C",
+        _scale_labels(graph_buf, bw, bh, lo_min, lo_span, "C",
                      temp_color(newest) if newest is not None else NORMAL,
                      right=True)
     tft.blit_buffer(memoryview(graph_buf)[:_G1_BYTES], GRAPH_X, G1_Y, bw, bh)
@@ -1013,7 +1031,7 @@ def draw_power_graph():
                      pmin, pspan, half_width=0)
         _plot_series(graph_buf, bw, bh, cpu_w_s.hist, CPU_MUTED,
                      pmin, pspan, half_width=0)
-        _scale_label(graph_buf, bw, bh, pmin, pspan, "W")
+        _scale_labels(graph_buf, bw, bh, pmin, pspan, "W")
     tft.blit_buffer(memoryview(graph_buf)[:_G2_BYTES], GRAPH_X, G2_Y, bw, bh)
 
 # =========================================================
@@ -1111,4 +1129,9 @@ def main():
         time.sleep(SAMPLE_PERIOD)
 
 
-main()
+# MicroPython names the entry-point script "__main__", same as CPython, so
+# this runs unchanged on the device. It also makes the module importable
+# (for tooling such as tools/render_preview.py) without falling into the
+# event loop.
+if __name__ == "__main__":
+    main()

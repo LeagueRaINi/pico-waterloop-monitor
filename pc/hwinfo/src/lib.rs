@@ -547,8 +547,8 @@ mod tests {
 
     #[test]
     fn the_reading_type_codes_are_the_ones_hwinfo_publishes() {
-        // These used to be named constants; the match is now the only place
-        // the numbers live, so this is what pins them.
+        // The match arm is the only place these numbers live, so this pins
+        // them against what HWiNFO actually publishes.
         assert_eq!(ReadingKind::from_raw(0), ReadingKind::None);
         assert_eq!(ReadingKind::from_raw(1), ReadingKind::Temperature);
         assert_eq!(ReadingKind::from_raw(2), ReadingKind::Voltage);

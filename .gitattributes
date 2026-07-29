@@ -1,5 +1,5 @@
-# Normalise to LF everywhere. deploy-pico.ps1 sends the contents of firmware/
-# to the device byte for byte, so a checkout must not vary by platform.
+# Normalise to LF everywhere. The Rust bridge embeds firmware/ byte for byte
+# and sends it to the device, so a checkout must not vary by platform.
 * text=auto eol=lf
 
 # Images are binary - never line-ending normalise them.

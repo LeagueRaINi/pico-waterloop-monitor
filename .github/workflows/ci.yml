@@ -63,16 +63,9 @@ jobs:
       - name: Compile firmware
         run: python -m compileall -q firmware
 
-      # The deploy tooling also runs Python on the device: the updater's
-      # helpers, and the prelude embedded in the PowerShell script. Both are
-      # parsed here for the same reason.
+      # The updater's helpers run as real Python on the Pico, but only ever
+      # get there as a string sent over the REPL - a syntax error would
+      # otherwise only show up as a traceback from a device someone is
+      # trying to update.
       - name: Compile the device-side deploy helpers
-        run: |
-          python -m compileall -q pc/hwinfo-pico-bridge-core/src/pico/prelude.py
-          python - <<'PY'
-          import re, pathlib
-          text = pathlib.Path('deploy-pico.ps1').read_text()
-          body = re.search(r"@'\n(.*?)\n'@", text, re.S)
-          assert body, "could not find the here-string prelude in deploy-pico.ps1"
-          compile(body.group(1), 'deploy-pico.ps1 prelude', 'exec')
-          PY
+        run: python -m compileall -q pc/hwinfo-pico-bridge-core/src/pico/prelude.py

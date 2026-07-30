@@ -654,6 +654,36 @@ def _toggle_zoom():
     finally:
         _pop_live()
 
+
+def _poll_buttons():
+    """
+    One tick's worth of wake/zoom/sleep-now button handling.
+
+    Edge, not level, for all three: leaving standby needs a fresh press so
+    the same press that woke the panel is not also read as zoom's or
+    sleep-now's first press once the checks below run; zoom and sleep-now
+    need it so holding the button does not repeat the action every tick.
+    """
+    global _prev_wake_pressed, _prev_zoom_pressed, _prev_sleep_pressed
+
+    wake_now = _wake_pressed()
+    zoom_now = _zoom_key is not None and _zoom_key.value() == 0
+    sleep_now = _sleep_key is not None and _sleep_key.value() == 0
+
+    if _standby:
+        if pc_link_fresh() or (wake_now and not _prev_wake_pressed):
+            leave_standby()
+    elif _standby_due():
+        enter_standby()
+    elif zoom_now and not _prev_zoom_pressed:
+        _toggle_zoom()
+    elif sleep_now and not _prev_sleep_pressed:
+        enter_standby()
+
+    _prev_wake_pressed = wake_now
+    _prev_zoom_pressed = zoom_now
+    _prev_sleep_pressed = sleep_now
+
 # =========================================================
 # STATIC SCREEN (drawn once directly to the display)
 # =========================================================
@@ -1128,7 +1158,7 @@ def _pop_live():
 # MAIN
 # =========================================================
 def main():
-    global _idle_ms, _prev_wake_pressed, _prev_zoom_pressed, _prev_sleep_pressed
+    global _idle_ms
 
     draw_static_screen()
 
@@ -1148,27 +1178,7 @@ def main():
         _idle_ms += time.ticks_diff(now, last_tick)
         last_tick = now
 
-        wake_now = _wake_pressed()
-        zoom_now = _zoom_key is not None and _zoom_key.value() == 0
-        sleep_now = _sleep_key is not None and _sleep_key.value() == 0
-
-        if _standby:
-            # A button is the way back when the PC is not coming: the panel
-            # then stays up for another full idle period. Edge, not level,
-            # so the same press that wakes it does not also register as
-            # zoom's or sleep-now's first press once it checks below.
-            if pc_link_fresh() or (wake_now and not _prev_wake_pressed):
-                leave_standby()
-        elif _standby_due():
-            enter_standby()
-        elif zoom_now and not _prev_zoom_pressed:
-            _toggle_zoom()
-        elif sleep_now and not _prev_sleep_pressed:
-            enter_standby()
-
-        _prev_wake_pressed = wake_now
-        _prev_zoom_pressed = zoom_now
-        _prev_sleep_pressed = sleep_now
+        _poll_buttons()
 
         temp = read_temperature()
         if temp is not None:

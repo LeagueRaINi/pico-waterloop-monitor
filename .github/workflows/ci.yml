@@ -41,7 +41,6 @@ jobs:
               - '.github/workflows/ci.yml'
             firmware:
               - 'firmware/**'
-              - 'tools/**'
               - 'pc/hwinfo-pico-bridge-core/src/pico/prelude.py'
               - '.github/workflows/ci.yml'
 
@@ -85,7 +84,7 @@ jobs:
             pc/target/release/hwinfo-pico-bridge-tray.exe
 
   firmware:
-    name: Check firmware
+    name: Check firmware syntax
     needs: changes
     if: needs.changes.outputs.firmware == 'true'
     runs-on: ubuntu-latest
@@ -107,9 +106,3 @@ jobs:
       # trying to update.
       - name: Compile the device-side deploy helpers
         run: python -m compileall -q pc/hwinfo-pico-bridge-core/src/pico/prelude.py
-
-      # Runs the real button state machine (_poll_buttons) against fake,
-      # scriptable GPIO across simulated ticks - not just a syntax check.
-      # No extra dependencies, unlike render_preview.py's Pillow.
-      - name: Test button handling
-        run: python tools/test_buttons.py

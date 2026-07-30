@@ -602,12 +602,17 @@ def pc_link_fresh():
 #
 # Two of the four buttons (`_key_confirmed[0]` and `[1]`) do something once
 # the panel is actually lit; the other two only ever wake it, same as
-# before. Which physical corner is which key is a property of the board
-# and this display's rotation, not of `tft_buttons.py`'s own comments -
-# those describe a different program's orientation, not this one's; do not
-# trust them here. While dark, all four are equivalent - any of them wakes
-# the panel, and the two with a job are read again once it is up, so the
-# press that woke it does not also count as that job's first press.
+# before. `key0`/`_key_confirmed[0]` (zoom) is the bottom-right button on
+# this board and rotation, `key1`/`[1]` (sleep-now) is bottom-left - not
+# what `tft_buttons.py`'s own comments claim, since those describe a
+# different program's screen orientation, not this one's. Confirmed on
+# actual hardware; if the board or rotation ever changes, don't trust this
+# either without checking again. While dark, all four are equivalent - any
+# of them wakes the panel, and the two with a job are read again once it
+# is up, so the press that woke it does not also count as that job's
+# first press. A tap does not always register - debounce (see
+# _debounce_buttons) needs the same reading on two consecutive ~250ms
+# polls, so a press has to be held for a bit, not just tapped.
 # =========================================================
 try:
     import st7789.config.tft_buttons as tft_buttons

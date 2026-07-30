@@ -49,15 +49,16 @@ real 30 minutes rather than an empty graph. PC data returning wakes it, as does 
 four buttons. A Pico that has *never* heard from a PC is left alone: that is standalone
 use, where blanking would just look broken.
 
-The top-right button cycles the temperature and power graphs through four windows —
+The bottom-right button cycles the temperature and power graphs through four windows —
 30 minutes, 15 minutes, 5 minutes, 30 seconds — each stretched across the same graph
 width. The three longer ones are trailing slices of the same history already being
 collected; the 30-second one draws from a small dedicated 1-second-resolution buffer,
 since 10-second buckets would give it only 3 points. Which window is active shows in the
-power graph's top-right corner. Bottom-right blanks the panel immediately instead of
+power graph's top-right corner. Bottom-left blanks the panel immediately instead of
 waiting out the idle timeout. The other two just wake it, like any button did before.
 While dark, all four are equivalent: any press wakes the panel, and only the press after
-that does its own job.
+that does its own job. A tap does not always register — buttons are debounced, so a
+press has to be held for a couple hundred milliseconds, not just tapped.
 
 ## Hardware
 

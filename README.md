@@ -31,7 +31,7 @@ so a small Windows program pushes HWiNFO's readings down the same cable.
 
 ## What it shows
 
-Two panels over a shared 15-minute clock, 5-second buckets, newest pinned to the right.
+Two panels over a shared 30-minute clock, 10-second buckets, newest pinned to the right.
 
 - **Temperatures** — coolant, CPU and GPU. Two scales: silicon down the left, coolant down
   the right in its own colour, so a couple of degrees of water is not squashed flat by tens
@@ -45,9 +45,20 @@ turns red below 300. With no PC link the coolant half still works and the PC row
 
 After five minutes without PC data the panel goes dark — the backlight is what ages here
 and most of what the board draws. Sampling carries on while it is off, so waking shows a
-real 15 minutes rather than an empty graph. PC data returning wakes it, as does any of the
+real 30 minutes rather than an empty graph. PC data returning wakes it, as does any of the
 four buttons. A Pico that has *never* heard from a PC is left alone: that is standalone
 use, where blanking would just look broken.
+
+The bottom-right button cycles the temperature and power graphs through four windows —
+30 minutes, 15 minutes, 5 minutes, 30 seconds — each stretched across the same graph
+width. The three longer ones are trailing slices of the same history already being
+collected; the 30-second one draws from a small dedicated 1-second-resolution buffer,
+since 10-second buckets would give it only 3 points. Which window is active shows in the
+power graph's top-right corner. Bottom-left blanks the panel immediately instead of
+waiting out the idle timeout. The other two just wake it, like any button did before.
+While dark, all four are equivalent: any press wakes the panel, and only the press after
+that does its own job. A tap does not always register — buttons are debounced, so a
+press has to be held for a couple hundred milliseconds, not just tapped.
 
 ## Hardware
 

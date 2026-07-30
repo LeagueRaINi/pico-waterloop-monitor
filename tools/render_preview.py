@@ -234,11 +234,20 @@ loop_hist = wander(n, 24.0, 30.5, start=25.0, step=0.02)
 cpu_w_hist = wander(n, 25, 165, start=60)
 gpu_w_hist = wander(n, 20, 240, start=80)
 
-main.cpu_s.hist[:] = cpu_hist
-main.gpu_s.hist[:] = gpu_hist
-main.loop_s.hist[:] = loop_hist
-main.cpu_w_s.hist[:] = cpu_w_hist
-main.gpu_w_s.hist[:] = gpu_w_hist
+main.cpu_s.hist[:] = array("f", cpu_hist)
+main.gpu_s.hist[:] = array("f", gpu_hist)
+main.loop_s.hist[:] = array("f", loop_hist)
+main.cpu_w_s.hist[:] = array("f", cpu_w_hist)
+main.gpu_w_s.hist[:] = array("f", gpu_w_hist)
+
+# The fine (30 s level) buffers aren't fed by the main loop here, so seed
+# them too - otherwise the shortest zoom level would render as empty.
+fn = main.FINE_POINTS
+main.cpu_fine.hist[:] = array("f", wander(fn, 38, 84, start=cpu_hist[-1]))
+main.gpu_fine.hist[:] = array("f", wander(fn, 35, 78, start=gpu_hist[-1]))
+main.loop_fine.hist[:] = array("f", wander(fn, 24.0, 30.5, start=loop_hist[-1], step=0.02))
+main.cpu_w_fine.hist[:] = array("f", wander(fn, 25, 165, start=cpu_w_hist[-1]))
+main.gpu_w_fine.hist[:] = array("f", wander(fn, 20, 240, start=gpu_w_hist[-1]))
 
 main.pc_cpu = cpu_hist[-1]
 main.pc_gpu = gpu_hist[-1]

@@ -49,6 +49,13 @@ real 15 minutes rather than an empty graph. PC data returning wakes it, as does 
 four buttons. A Pico that has *never* heard from a PC is left alone: that is standalone
 use, where blanking would just look broken.
 
+The top-right button toggles the temperature and power graphs between the full 15
+minutes and the last 5, stretched across the same width — a closer look at what just
+happened, from data already being collected. Bottom-right blanks the panel immediately
+instead of waiting out the idle timeout. The other two just wake it, like any button did
+before. While dark, all four are equivalent: any press wakes the panel, and only the
+press after that does its own job.
+
 ## Hardware
 
 | | |

@@ -67,6 +67,12 @@ HISTORY_POINTS  = 180                                # points across the graph
 BUCKET_SECONDS  = WINDOW_SECONDS / HISTORY_POINTS    # 5 s per point
 BUCKET_MS       = int(BUCKET_SECONDS * 1000)
 
+# A button cycles the graphs between this and the full window above, using
+# history already being collected - no extra storage, since 5 minutes of
+# 5-second buckets is a trailing slice of the same 180 points.
+ZOOM_WINDOW_SECONDS = 5 * 60                                # 300 s
+ZOOM_POINTS         = int(ZOOM_WINDOW_SECONDS / BUCKET_SECONDS)   # 60 points
+
 SAMPLE_PERIOD   = 0.25          # ADC / big number update period
 GRAPH_PERIOD_MS = 2000          # graph panel redraw period
 PC_TIMEOUT_MS   = 8000          # no serial data for this long -> "NO DATA"
@@ -548,7 +554,7 @@ def pc_link_fresh():
     return time.ticks_diff(time.ticks_ms(), pc_last_ms) < PC_TIMEOUT_MS
 
 # =========================================================
-# STANDBY
+# STANDBY, ZOOM AND SLEEP-NOW
 #
 # Not for burn-in: this is an IPS LCD, where that is not a failure mode. The
 # backlight is what ages, and it is most of what the board draws, so there is
@@ -556,6 +562,12 @@ def pc_link_fresh():
 #
 # Sampling carries on while dark, so waking shows a real 15 minutes of history
 # rather than an empty graph.
+#
+# Two of the four buttons do something once the panel is actually lit: the
+# other two (bottom-left, top-left) only ever wake it, same as before. While
+# dark, all four are equivalent - any of them wakes the panel; the two with
+# a job are read again once it is up, so the press that woke it does not
+# also count as that job's first press.
 # =========================================================
 try:
     import st7789.config.tft_buttons as tft_buttons
@@ -563,11 +575,23 @@ try:
 except Exception:
     _wake_keys = ()          # no buttons wired; the PC link still wakes it
 
+_zoom_key  = _wake_keys[0] if len(_wake_keys) > 0 else None   # top right
+_sleep_key = _wake_keys[1] if len(_wake_keys) > 1 else None   # bottom right
+
 _standby = False
 # Counted up by the main loop and zeroed whenever the PC speaks, rather than
 # measured against ticks_ms.  time.ticks_diff is only meaningful for about six
 # days, and a Pico on standby USB power outlives that easily.
 _idle_ms = 0
+
+_zoomed = False   # graphs show ZOOM_POINTS instead of the full HISTORY_POINTS
+
+# Level, not edge, is what a plain wake needs - holding a button is still a
+# reason to stay awake. Zoom and sleep-now toggle something, so those need
+# the rising edge instead, tracked here between ticks of the main loop.
+_prev_wake_pressed = False
+_prev_zoom_pressed = False
+_prev_sleep_pressed = False
 
 
 def _standby_due():
@@ -613,6 +637,22 @@ def leave_standby():
     _last_pc_key = None
     if tft.backlight is not None:
         tft.backlight.value(1)
+
+
+def _toggle_zoom():
+    """
+    Flip between the full window and ZOOM_POINTS, and redraw right away -
+    the point of a button for this is that it reacts now, not up to
+    GRAPH_PERIOD_MS later.
+    """
+    global _zoomed
+    _zoomed = not _zoomed
+    _push_live()
+    try:
+        draw_temp_graph()
+        draw_power_graph()
+    finally:
+        _pop_live()
 
 # =========================================================
 # STATIC SCREEN (drawn once directly to the display)
@@ -720,10 +760,10 @@ def draw_pc_panel():
 # GRAPH ENGINE
 #
 # The newest point sits on the right edge and history extends leftwards, so
-# "now" is always in the same place and the 5-minute gridlines mean the same
-# thing from the first second onwards.
+# "now" is always in the same place regardless of window or zoom level.
 # =========================================================
-X_STEP = (GRAPH_W - 1) / (HISTORY_POINTS - 1)
+X_STEP      = (GRAPH_W - 1) / (HISTORY_POINTS - 1)   # full window
+X_STEP_ZOOM = (GRAPH_W - 1) / (ZOOM_POINTS - 1)       # zoomed-in window
 
 
 def _graph_background(buf, bw, bh, nbytes, hlines=True):
@@ -731,7 +771,7 @@ def _graph_background(buf, bw, bh, nbytes, hlines=True):
     if hlines:
         for i in range(1, 4):                   # horizontal grid
             _buf_hline(buf, 0, (bh * i) // 4, bw, GRID, bw, bh)
-    for i in range(1, 6):                       # every 5 minutes
+    for i in range(1, 6):                       # six even divisions of the window
         _buf_vrun(buf, (bw - 1) * i // 6, 0, bh - 1, GRID, bw, bh)
 
 
@@ -887,20 +927,26 @@ def _plot_run_blend(buf: ptr16, ys: ptr16, cols: ptr16, meta: ptr32):
         i = i + 1
 
 
-def _plot_series(buf, bw, bh, data, color, tmin, span, half_width=1, blend_bg=None):
+def _plot_series(buf, bw, bh, data, color, tmin, span, half_width=1, blend_bg=None,
+                 x_step=X_STEP):
     """
     `color` is either a 565 value or a function of the sample value.
 
     `blend_bg` is `(panel_color, grid_color)` for a series drawn where
     another one may already be - see `_plot_run_blend`. `None` (the default)
     draws solid, as every series but the coolant one does.
+
+    `x_step` is pixels per bucket for the window currently on screen - the
+    full 15 minutes by default, or `X_STEP_ZOOM` when a caller wants the
+    same trailing slice of history spread across the full graph width
+    instead of bunched at the right edge.
     """
     tinted = callable(color)
     n = len(data)
     if n < 1:
         return
 
-    x_first = (bw - 1) - (n - 1) * X_STEP       # x of data[0]
+    x_first = (bw - 1) - (n - 1) * x_step       # x of data[0]
     start_px = int(x_first) if x_first > 0 else 0
     inv_span = 1.0 / span
     usable = bh - 1
@@ -912,7 +958,7 @@ def _plot_series(buf, bw, bh, data, color, tmin, span, half_width=1, blend_bg=No
     count = 0
 
     for px in range(start_px, bw):
-        pos = (px - x_first) / X_STEP
+        pos = (px - x_first) / x_step
         if pos < 0:
             pos = 0.0
         i = int(pos)
@@ -968,6 +1014,11 @@ def _scale_labels(buf, bw, bh, tmin, span, unit, color=TEXT_DIM, right=False):
                    color, PANEL, bw, bh)
 
 
+def _graph_window():
+    """(point count, x-step) for whichever window is currently on screen."""
+    return (ZOOM_POINTS, X_STEP_ZOOM) if _zoomed else (HISTORY_POINTS, X_STEP)
+
+
 def draw_temp_graph():
     """
     Coolant, CPU and GPU on one panel, on two scales.
@@ -991,18 +1042,24 @@ def draw_temp_graph():
     bw, bh = GRAPH_W, G1_H
     _graph_background(graph_buf, bw, bh, _G1_BYTES, hlines=False)
 
-    si_min, si_span = _series_range((cpu_s.hist, gpu_s.hist))
-    lo_min, lo_span = _series_range((loop_s.hist,))
+    points, step = _graph_window()
+    cpu_view = cpu_s.hist[-points:]
+    gpu_view = gpu_s.hist[-points:]
+    loop_view = loop_s.hist[-points:]
+
+    si_min, si_span = _series_range((cpu_view, gpu_view))
+    lo_min, lo_span = _series_range((loop_view,))
 
     # Silicon first, so coolant lands on top of it where they cross.
     if si_min is not None:
-        _plot_series(graph_buf, bw, bh, gpu_s.hist, GPU_MUTED,
-                     si_min, si_span, half_width=0)
-        _plot_series(graph_buf, bw, bh, cpu_s.hist, CPU_MUTED,
-                     si_min, si_span, half_width=0)
+        _plot_series(graph_buf, bw, bh, gpu_view, GPU_MUTED,
+                     si_min, si_span, half_width=0, x_step=step)
+        _plot_series(graph_buf, bw, bh, cpu_view, CPU_MUTED,
+                     si_min, si_span, half_width=0, x_step=step)
     if lo_min is not None:
-        _plot_series(graph_buf, bw, bh, loop_s.hist, temp_color,
-                     lo_min, lo_span, half_width=0, blend_bg=(PANEL, GRID))
+        _plot_series(graph_buf, bw, bh, loop_view, temp_color,
+                     lo_min, lo_span, half_width=0, blend_bg=(PANEL, GRID),
+                     x_step=step)
 
     # Labels last, after every trace - drawing order is what keeps the
     # halo legible, since a line plotted on top of it would poke straight
@@ -1010,7 +1067,7 @@ def draw_temp_graph():
     if si_min is not None:
         _scale_labels(graph_buf, bw, bh, si_min, si_span, "C")
     if lo_min is not None:
-        newest = _latest(loop_s.hist)
+        newest = _latest(loop_view)
         _scale_labels(graph_buf, bw, bh, lo_min, lo_span, "C",
                      temp_color(newest) if newest is not None else NORMAL,
                      right=True)
@@ -1022,15 +1079,19 @@ def draw_power_graph():
     bw, bh = GRAPH_W, G2_H
     _graph_background(graph_buf, bw, bh, _G2_BYTES)
 
+    points, step = _graph_window()
+    cpu_w_view = cpu_w_s.hist[-points:]
+    gpu_w_view = gpu_w_s.hist[-points:]
+
     # A 20 W floor stops idle jitter being amplified to fill the panel.
-    pmin, pspan = _series_range((cpu_w_s.hist, gpu_w_s.hist), min_span=20.0)
+    pmin, pspan = _series_range((cpu_w_view, gpu_w_view), min_span=20.0)
     if pmin is not None:
         # Same weight and muted colours as the panel above: CPU is CPU on both,
         # and hairlines carry a spiky series like power better than thick ones.
-        _plot_series(graph_buf, bw, bh, gpu_w_s.hist, GPU_MUTED,
-                     pmin, pspan, half_width=0)
-        _plot_series(graph_buf, bw, bh, cpu_w_s.hist, CPU_MUTED,
-                     pmin, pspan, half_width=0)
+        _plot_series(graph_buf, bw, bh, gpu_w_view, GPU_MUTED,
+                     pmin, pspan, half_width=0, x_step=step)
+        _plot_series(graph_buf, bw, bh, cpu_w_view, CPU_MUTED,
+                     pmin, pspan, half_width=0, x_step=step)
         _scale_labels(graph_buf, bw, bh, pmin, pspan, "W")
     tft.blit_buffer(memoryview(graph_buf)[:_G2_BYTES], GRAPH_X, G2_Y, bw, bh)
 
@@ -1067,7 +1128,7 @@ def _pop_live():
 # MAIN
 # =========================================================
 def main():
-    global _idle_ms
+    global _idle_ms, _prev_wake_pressed, _prev_zoom_pressed, _prev_sleep_pressed
 
     draw_static_screen()
 
@@ -1087,13 +1148,27 @@ def main():
         _idle_ms += time.ticks_diff(now, last_tick)
         last_tick = now
 
+        wake_now = _wake_pressed()
+        zoom_now = _zoom_key is not None and _zoom_key.value() == 0
+        sleep_now = _sleep_key is not None and _sleep_key.value() == 0
+
         if _standby:
             # A button is the way back when the PC is not coming: the panel
-            # then stays up for another full idle period.
-            if pc_link_fresh() or _wake_pressed():
+            # then stays up for another full idle period. Edge, not level,
+            # so the same press that wakes it does not also register as
+            # zoom's or sleep-now's first press once it checks below.
+            if pc_link_fresh() or (wake_now and not _prev_wake_pressed):
                 leave_standby()
         elif _standby_due():
             enter_standby()
+        elif zoom_now and not _prev_zoom_pressed:
+            _toggle_zoom()
+        elif sleep_now and not _prev_sleep_pressed:
+            enter_standby()
+
+        _prev_wake_pressed = wake_now
+        _prev_zoom_pressed = zoom_now
+        _prev_sleep_pressed = sleep_now
 
         temp = read_temperature()
         if temp is not None:

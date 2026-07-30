@@ -57,21 +57,36 @@ GPU_MUTED  = st7789.color565(88, 76, 150)
 STALE      = st7789.color565(90, 96, 105)
 
 # =========================================================
-# TIMEBASE  —  15 minute rolling window
+# TIMEBASE  —  30 minute rolling window
 #
 # Sampling stays fast so the big number reacts, but samples are averaged into
 # BUCKET_SECONDS-wide buckets; one bucket is one plotted point.
 # =========================================================
-WINDOW_SECONDS  = 15 * 60                            # 900 s of history
+WINDOW_SECONDS  = 30 * 60                            # 1800 s of history
 HISTORY_POINTS  = 180                                # points across the graph
-BUCKET_SECONDS  = WINDOW_SECONDS / HISTORY_POINTS    # 5 s per point
+BUCKET_SECONDS  = WINDOW_SECONDS / HISTORY_POINTS    # 10 s per point
 BUCKET_MS       = int(BUCKET_SECONDS * 1000)
 
-# A button cycles the graphs between this and the full window above, using
-# history already being collected - no extra storage, since 5 minutes of
-# 5-second buckets is a trailing slice of the same 180 points.
-ZOOM_WINDOW_SECONDS = 5 * 60                                # 300 s
-ZOOM_POINTS         = int(ZOOM_WINDOW_SECONDS / BUCKET_SECONDS)   # 60 points
+# A dedicated 1-second-bucket buffer backs the shortest zoom level - the
+# 10-second coarse buckets above would give it only 3 points across 30
+# seconds, not enough to look like anything but straight lines. The other
+# three levels are trailing slices of the coarse buffer above; no reason to
+# pay for finer resolution than 5 or 15 or 30 minutes actually needs.
+FINE_BUCKET_SECONDS = 1
+FINE_BUCKET_MS      = int(FINE_BUCKET_SECONDS * 1000)
+FINE_WINDOW_SECONDS = 60                                  # headroom over the 30 s level
+FINE_POINTS         = int(FINE_WINDOW_SECONDS / FINE_BUCKET_SECONDS)   # 60 points
+
+# (duration, bucket width, label) for what the zoom button cycles through.
+ZOOM_LEVELS = (
+    (WINDOW_SECONDS, BUCKET_SECONDS, "30m"),
+    (15 * 60,        BUCKET_SECONDS, "15m"),
+    (5 * 60,         BUCKET_SECONDS, "5m"),
+    (30,             FINE_BUCKET_SECONDS, "30s"),
+)
+ZOOM_POINTS = tuple(max(2, int(d / b)) for d, b, _ in ZOOM_LEVELS)
+ZOOM_LABELS = tuple(label for _, _, label in ZOOM_LEVELS)
+ZOOM_FINE   = tuple(b == FINE_BUCKET_SECONDS for _, b, _ in ZOOM_LEVELS)
 
 SAMPLE_PERIOD   = 0.25          # ADC / big number update period
 GRAPH_PERIOD_MS = 2000          # graph panel redraw period
@@ -129,14 +144,23 @@ G2_Y,  G2_H        = 160, 74    # cpu + gpu power
 # index is the same moment in time on both graphs.
 # =========================================================
 class Series:
-    """A rolling window of bucket averages, plus the bucket being filled."""
+    """
+    A rolling window of bucket averages, plus the bucket being filled.
 
-    __slots__ = ("hist", "_total", "_count")
+    `hist` is a packed `array('f')`, not a list - each entry costs 4 bytes
+    instead of a boxed float object's ~20, which is what makes the second,
+    finer-grained history buffer for the zoomed-in view affordable. Arrays
+    cannot hold `None`, so a missing bucket is NaN instead; every reader
+    of `hist` treats `v != v` (true only for NaN) as "no data here".
+    """
 
-    def __init__(self):
-        self.hist = []
+    __slots__ = ("hist", "_total", "_count", "_max")
+
+    def __init__(self, max_points=HISTORY_POINTS):
+        self.hist = array("f")
         self._total = 0.0
         self._count = 0
+        self._max = max_points
 
     def add(self, value):
         if value is not None:
@@ -144,12 +168,12 @@ class Series:
             self._count += 1
 
     def _bucket_avg(self):
-        return (self._total / self._count) if self._count else None
+        return (self._total / self._count) if self._count else float("nan")
 
     def close(self):
         """Commit the open bucket to history and start a fresh one."""
         self.hist.append(self._bucket_avg())
-        while len(self.hist) > HISTORY_POINTS:
+        while len(self.hist) > self._max:
             self.hist.pop(0)
         self._total = 0.0
         self._count = 0
@@ -157,11 +181,11 @@ class Series:
     def push_live(self):
         """
         Temporarily append the still-open bucket so the graphs move between
-        bucket boundaries instead of freezing for 10 s at a time.
+        bucket boundaries instead of freezing for a whole bucket at a time.
 
-        The list is allowed to run one over HISTORY_POINTS - trimming it would
-        discard a real bucket that pop_live() could not put back.  The plotter
-        just lets the oldest point fall off the left edge.
+        `hist` is allowed to run one over the cap - trimming it would
+        discard a real bucket that pop_live() could not put back.  The
+        plotter just lets the oldest point fall off the left edge.
         """
         self.hist.append(self._bucket_avg())
 
@@ -177,6 +201,15 @@ cpu_w_s = Series()      # cpu package power
 gpu_w_s = Series()      # gpu board power
 
 ALL_SERIES = (loop_s, cpu_s, gpu_s, cpu_w_s, gpu_w_s)
+
+# Same five, at FINE_BUCKET_SECONDS resolution, for the shortest zoom level.
+loop_fine  = Series(FINE_POINTS)
+cpu_fine   = Series(FINE_POINTS)
+gpu_fine   = Series(FINE_POINTS)
+cpu_w_fine = Series(FINE_POINTS)
+gpu_w_fine = Series(FINE_POINTS)
+
+ALL_FINE_SERIES = (loop_fine, cpu_fine, gpu_fine, cpu_w_fine, gpu_w_fine)
 
 # latest values from the PC bridge
 pc_cpu     = None
@@ -560,14 +593,17 @@ def pc_link_fresh():
 # backlight is what ages, and it is most of what the board draws, so there is
 # no reason to run it while the PC it reports on is asleep.
 #
-# Sampling carries on while dark, so waking shows a real 15 minutes of history
+# Sampling carries on while dark, so waking shows a real 30 minutes of history
 # rather than an empty graph.
 #
-# Two of the four buttons do something once the panel is actually lit: the
-# other two (bottom-left, top-left) only ever wake it, same as before. While
-# dark, all four are equivalent - any of them wakes the panel; the two with
-# a job are read again once it is up, so the press that woke it does not
-# also count as that job's first press.
+# Two of the four buttons (`_key_confirmed[0]` and `[1]`) do something once
+# the panel is actually lit; the other two only ever wake it, same as
+# before. Which physical corner is which key is a property of the board
+# and this display's rotation, not of `tft_buttons.py`'s own comments -
+# those describe a different program's orientation, not this one's; do not
+# trust them here. While dark, all four are equivalent - any of them wakes
+# the panel, and the two with a job are read again once it is up, so the
+# press that woke it does not also count as that job's first press.
 # =========================================================
 try:
     import st7789.config.tft_buttons as tft_buttons
@@ -575,8 +611,13 @@ try:
 except Exception:
     _wake_keys = ()          # no buttons wired; the PC link still wakes it
 
-_zoom_key  = _wake_keys[0] if len(_wake_keys) > 0 else None   # top right
-_sleep_key = _wake_keys[1] if len(_wake_keys) > 1 else None   # bottom right
+# Two consecutive ~250ms-spaced polls have to agree before a key's
+# confirmed state moves - cheap tactile switches on a board like this can
+# have marginal contact that flickers for a read or two even mid-hold, not
+# just bounce right at the transition, and a single bad read must not be
+# able to flip anything on its own.
+_key_last_raw  = [False] * len(_wake_keys)
+_key_confirmed = [False] * len(_wake_keys)
 
 _standby = False
 # Counted up by the main loop and zeroed whenever the PC speaks, rather than
@@ -584,7 +625,11 @@ _standby = False
 # days, and a Pico on standby USB power outlives that easily.
 _idle_ms = 0
 
-_zoomed = False   # graphs show ZOOM_POINTS instead of the full HISTORY_POINTS
+_zoom_level = 0   # index into ZOOM_LEVELS/ZOOM_POINTS/ZOOM_LABELS; 0 = full window
+
+# Set when standby was entered by the sleep-now button rather than the idle
+# timeout - see leave_standby's use of it below.
+_manual_sleep = False
 
 # Level, not edge, is what a plain wake needs - holding a button is still a
 # reason to stay awake. Zoom and sleep-now toggle something, so those need
@@ -607,16 +652,18 @@ def _standby_due():
             and _idle_ms > STANDBY_AFTER_MS)
 
 
-def _wake_pressed():
-    for key in _wake_keys:            # active low; the config pulls them up
-        if key.value() == 0:
-            return True
-    return False
+def _debounce_buttons():
+    for i, key in enumerate(_wake_keys):
+        raw = key.value() == 0
+        if raw == _key_last_raw[i]:
+            _key_confirmed[i] = raw
+        _key_last_raw[i] = raw
 
 
-def enter_standby():
-    global _standby
+def enter_standby(manual=False):
+    global _standby, _manual_sleep
     _standby = True
+    _manual_sleep = manual
     # Backlight first: the panel may show anything on its way into sleep, and
     # there is no reason for that to be visible.
     if tft.backlight is not None:
@@ -625,8 +672,9 @@ def enter_standby():
 
 
 def leave_standby():
-    global _standby, _idle_ms, _last_temp_key, _last_pc_key
+    global _standby, _manual_sleep, _idle_ms, _last_temp_key, _last_pc_key
     _standby = False
+    _manual_sleep = False
     _idle_ms = 0
     tft.sleep_mode(False)
     time.sleep_ms(120)                # the ST7789 wants this after SLPOUT
@@ -639,14 +687,14 @@ def leave_standby():
         tft.backlight.value(1)
 
 
-def _toggle_zoom():
+def _cycle_zoom():
     """
-    Flip between the full window and ZOOM_POINTS, and redraw right away -
-    the point of a button for this is that it reacts now, not up to
-    GRAPH_PERIOD_MS later.
+    Step to the next window in ZOOM_LEVELS, wrapping back to the full one,
+    and redraw right away - the point of a button for this is that it
+    reacts now, not up to GRAPH_PERIOD_MS later.
     """
-    global _zoomed
-    _zoomed = not _zoomed
+    global _zoom_level
+    _zoom_level = (_zoom_level + 1) % len(ZOOM_LEVELS)
     _push_live()
     try:
         draw_temp_graph()
@@ -663,22 +711,30 @@ def _poll_buttons():
     the same press that woke the panel is not also read as zoom's or
     sleep-now's first press once the checks below run; zoom and sleep-now
     need it so holding the button does not repeat the action every tick.
+
+    Manual sleep only leaves on a real press, never on `pc_link_fresh()`:
+    the PC was already talking when the panel went dark on purpose, so it
+    "still talking" a moment later says nothing. That check is for the
+    idle-timeout case, where the PC being fresh again means it was gone -
+    silent for the whole `STANDBY_AFTER_MS` - and has only just come back.
     """
     global _prev_wake_pressed, _prev_zoom_pressed, _prev_sleep_pressed
 
-    wake_now = _wake_pressed()
-    zoom_now = _zoom_key is not None and _zoom_key.value() == 0
-    sleep_now = _sleep_key is not None and _sleep_key.value() == 0
+    _debounce_buttons()
+    wake_now = any(_key_confirmed)
+    zoom_now = len(_key_confirmed) > 0 and _key_confirmed[0]
+    sleep_now = len(_key_confirmed) > 1 and _key_confirmed[1]
 
     if _standby:
-        if pc_link_fresh() or (wake_now and not _prev_wake_pressed):
+        woke = wake_now and not _prev_wake_pressed
+        if woke or (not _manual_sleep and pc_link_fresh()):
             leave_standby()
     elif _standby_due():
         enter_standby()
     elif zoom_now and not _prev_zoom_pressed:
-        _toggle_zoom()
+        _cycle_zoom()
     elif sleep_now and not _prev_sleep_pressed:
-        enter_standby()
+        enter_standby(manual=True)
 
     _prev_wake_pressed = wake_now
     _prev_zoom_pressed = zoom_now
@@ -792,8 +848,8 @@ def draw_pc_panel():
 # The newest point sits on the right edge and history extends leftwards, so
 # "now" is always in the same place regardless of window or zoom level.
 # =========================================================
-X_STEP      = (GRAPH_W - 1) / (HISTORY_POINTS - 1)   # full window
-X_STEP_ZOOM = (GRAPH_W - 1) / (ZOOM_POINTS - 1)       # zoomed-in window
+X_STEP  = (GRAPH_W - 1) / (HISTORY_POINTS - 1)             # full window; also the default below
+X_STEPS = tuple((GRAPH_W - 1) / (p - 1) for p in ZOOM_POINTS)   # one per zoom level
 
 
 def _graph_background(buf, bw, bh, nbytes, hlines=True):
@@ -811,7 +867,7 @@ def _series_range(series_list, min_span=2.0):
     hi = None
     for data in series_list:
         for v in data:
-            if v is None:
+            if v != v:            # NaN marks a missing bucket
                 continue
             if lo is None or v < lo:
                 lo = v
@@ -825,10 +881,11 @@ def _series_range(series_list, min_span=2.0):
 
 
 def _latest(data):
-    """Newest non-None sample, for colouring things by the current value."""
+    """Newest real (non-NaN) sample, for colouring things by its value."""
     for i in range(len(data) - 1, -1, -1):
-        if data[i] is not None:
-            return data[i]
+        v = data[i]
+        if v == v:              # not NaN - a real reading
+            return v
     return None
 
 
@@ -967,8 +1024,8 @@ def _plot_series(buf, bw, bh, data, color, tmin, span, half_width=1, blend_bg=No
     draws solid, as every series but the coolant one does.
 
     `x_step` is pixels per bucket for the window currently on screen - the
-    full 15 minutes by default, or `X_STEP_ZOOM` when a caller wants the
-    same trailing slice of history spread across the full graph width
+    full window by default, or one of `X_STEPS` when a caller wants a
+    shorter trailing slice of history spread across the full graph width
     instead of bunched at the right edge.
     """
     tinted = callable(color)
@@ -994,10 +1051,12 @@ def _plot_series(buf, bw, bh, data, color, tmin, span, half_width=1, blend_bg=No
         i = int(pos)
         if i >= n - 1:
             val = data[n - 1]
+            if val != val:                # NaN marks a missing bucket
+                val = None
         else:
             a = data[i]
             b = data[i + 1]
-            if a is None or b is None:
+            if a != a or b != b:          # NaN marks a missing bucket
                 val = None
             else:
                 val = a + (b - a) * (pos - i)
@@ -1045,8 +1104,9 @@ def _scale_labels(buf, bw, bh, tmin, span, unit, color=TEXT_DIM, right=False):
 
 
 def _graph_window():
-    """(point count, x-step) for whichever window is currently on screen."""
-    return (ZOOM_POINTS, X_STEP_ZOOM) if _zoomed else (HISTORY_POINTS, X_STEP)
+    """(point count, x-step, series to read) for the window on screen."""
+    series = ALL_FINE_SERIES if ZOOM_FINE[_zoom_level] else ALL_SERIES
+    return ZOOM_POINTS[_zoom_level], X_STEPS[_zoom_level], series
 
 
 def draw_temp_graph():
@@ -1072,10 +1132,11 @@ def draw_temp_graph():
     bw, bh = GRAPH_W, G1_H
     _graph_background(graph_buf, bw, bh, _G1_BYTES, hlines=False)
 
-    points, step = _graph_window()
-    cpu_view = cpu_s.hist[-points:]
-    gpu_view = gpu_s.hist[-points:]
-    loop_view = loop_s.hist[-points:]
+    points, step, series = _graph_window()
+    loop_series, cpu_series, gpu_series = series[0], series[1], series[2]
+    cpu_view = cpu_series.hist[-points:]
+    gpu_view = gpu_series.hist[-points:]
+    loop_view = loop_series.hist[-points:]
 
     si_min, si_span = _series_range((cpu_view, gpu_view))
     lo_min, lo_span = _series_range((loop_view,))
@@ -1109,9 +1170,10 @@ def draw_power_graph():
     bw, bh = GRAPH_W, G2_H
     _graph_background(graph_buf, bw, bh, _G2_BYTES)
 
-    points, step = _graph_window()
-    cpu_w_view = cpu_w_s.hist[-points:]
-    gpu_w_view = gpu_w_s.hist[-points:]
+    points, step, series = _graph_window()
+    cpu_w_series, gpu_w_series = series[3], series[4]
+    cpu_w_view = cpu_w_series.hist[-points:]
+    gpu_w_view = gpu_w_series.hist[-points:]
 
     # A 20 W floor stops idle jitter being amplified to fill the panel.
     pmin, pspan = _series_range((cpu_w_view, gpu_w_view), min_span=20.0)
@@ -1123,6 +1185,14 @@ def draw_power_graph():
         _plot_series(graph_buf, bw, bh, cpu_w_view, CPU_MUTED,
                      pmin, pspan, half_width=0, x_step=step)
         _scale_labels(graph_buf, bw, bh, pmin, pspan, "W")
+
+    # Which window is on screen is otherwise only visible as a jump in
+    # scale and how spread out the traces are - easy to not notice, and
+    # then forget the graphs are zoomed in at all.
+    window_text = ZOOM_LABELS[_zoom_level]
+    window_x = bw - 2 - len(window_text) * font_small.WIDTH
+    _buf_text_halo(graph_buf, font_small, window_text, window_x, 1,
+                   TEXT_DIM, PANEL, bw, bh)
     tft.blit_buffer(memoryview(graph_buf)[:_G2_BYTES], GRAPH_X, G2_Y, bw, bh)
 
 # =========================================================
@@ -1130,6 +1200,7 @@ def draw_power_graph():
 # =========================================================
 def accumulate(loop_temp):
     loop_s.add(loop_temp)
+    loop_fine.add(loop_temp)
     # Only fold PC values in while the link is alive, so a dead bridge leaves
     # a gap in the history rather than a flat line at the last known value.
     if pc_link_fresh():
@@ -1137,6 +1208,10 @@ def accumulate(loop_temp):
         gpu_s.add(pc_gpu)
         cpu_w_s.add(pc_cpu_w)
         gpu_w_s.add(pc_gpu_w)
+        cpu_fine.add(pc_cpu)
+        gpu_fine.add(pc_gpu)
+        cpu_w_fine.add(pc_cpu_w)
+        gpu_w_fine.add(pc_gpu_w)
 
 
 def close_bucket():
@@ -1144,13 +1219,22 @@ def close_bucket():
         series.close()
 
 
+def close_fine_bucket():
+    for series in ALL_FINE_SERIES:
+        series.close()
+
+
 def _push_live():
     for series in ALL_SERIES:
+        series.push_live()
+    for series in ALL_FINE_SERIES:
         series.push_live()
 
 
 def _pop_live():
     for series in ALL_SERIES:
+        series.pop_live()
+    for series in ALL_FINE_SERIES:
         series.pop_live()
 
 
@@ -1167,6 +1251,7 @@ def main():
     now = time.ticks_ms()
     last_tick = now
     next_bucket_ms = time.ticks_add(now, BUCKET_MS)
+    next_fine_bucket_ms = time.ticks_add(now, FINE_BUCKET_MS)
     next_graph_ms = now
 
     while True:
@@ -1199,6 +1284,11 @@ def main():
             if time.ticks_diff(now, next_bucket_ms) >= 0:   # fell behind
                 next_bucket_ms = time.ticks_add(now, BUCKET_MS)
 
+        if time.ticks_diff(now, next_fine_bucket_ms) >= 0:
+            close_fine_bucket()
+            next_fine_bucket_ms = time.ticks_add(next_fine_bucket_ms, FINE_BUCKET_MS)
+            if time.ticks_diff(now, next_fine_bucket_ms) >= 0:   # fell behind
+                next_fine_bucket_ms = time.ticks_add(now, FINE_BUCKET_MS)
         # The timer is advanced even while dark, so it cannot fall so far
         # behind that ticks_diff stops meaning anything.
         if time.ticks_diff(now, next_graph_ms) >= 0:

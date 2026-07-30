@@ -151,7 +151,10 @@ class Series:
     instead of a boxed float object's ~20, which is what makes the second,
     finer-grained history buffer for the zoomed-in view affordable. Arrays
     cannot hold `None`, so a missing bucket is NaN instead; every reader
-    of `hist` treats `v != v` (true only for NaN) as "no data here".
+    of `hist` treats `v != v` (true only for NaN) as "no data here". This
+    MicroPython build's array has no `.pop()` at all (confirmed on the
+    actual device, not just from the docs) - trimming is a slice
+    assignment to an empty array instead, which it does support.
     """
 
     __slots__ = ("hist", "_total", "_count", "_max")
@@ -173,8 +176,9 @@ class Series:
     def close(self):
         """Commit the open bucket to history and start a fresh one."""
         self.hist.append(self._bucket_avg())
-        while len(self.hist) > self._max:
-            self.hist.pop(0)
+        excess = len(self.hist) - self._max
+        if excess > 0:
+            self.hist[0:excess] = array("f")
         self._total = 0.0
         self._count = 0
 
@@ -191,7 +195,7 @@ class Series:
 
     def pop_live(self):
         if self.hist:
-            self.hist.pop()
+            self.hist[-1:] = array("f")
 
 
 loop_s  = Series()      # coolant, from the thermistor
